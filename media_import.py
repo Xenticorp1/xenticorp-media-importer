@@ -40,6 +40,8 @@ MOUNT_BASE = Path("/run/media-import")
 LOCK_FILE = "/run/media-import.lock"
 CHUNK = 8 * 1024 * 1024
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
+# Episode codes like S01E01 / s1e1 / 1x01; loose files matching this aren't movies.
+EPISODE_RE = re.compile(r"(?i)(?<![a-z0-9])(s\d{1,2}\s*e\d{1,3}|\d{1,2}x\d{2,3})(?![0-9])")
 # -----------------------------------------------------------------------------
 
 
@@ -133,11 +135,16 @@ def import_media(root: Path):
         return 2
 
     jobs = []  # (src, dst)
+    skipped = 0  # misplaced episodes left on the USB
     for entry in sorted(src_dir.iterdir(), key=lambda p: p.name.lower()):
         if is_junk(entry.name):
             continue
         if entry.is_file():
             if entry.suffix.lower() in MOVIE_EXTS:
+                if EPISODE_RE.search(entry.name):
+                    log(f"Skipping '{entry.name}': looks like a TV episode, put it in a show folder")
+                    skipped += 1
+                    continue
                 jobs.append((entry, MOVIES_DIR / entry.name))
             else:
                 log(f"Skipping non-video file: {entry.name}")
@@ -154,6 +161,9 @@ def import_media(root: Path):
 
     if not jobs:
         log("Nothing to import.")
+        if skipped:
+            log(f"Done: 0 imported, 0 failed, {skipped} skipped (misplaced episodes).")
+            return 1
         return 0
 
     ok, failed = 0, []
@@ -188,8 +198,8 @@ def import_media(root: Path):
             log(f"  Could not remove {d}: {e}")
 
     os.sync()
-    log(f"Done: {ok} imported, {len(failed)} failed.")
-    return 1 if failed else 0
+    log(f"Done: {ok} imported, {len(failed)} failed, {skipped} skipped (misplaced episodes).")
+    return 1 if failed or skipped else 0
 
 
 def ignored_uuids():
