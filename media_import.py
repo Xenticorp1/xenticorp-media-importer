@@ -200,6 +200,44 @@ def ignored_uuids():
         return set()
 
 
+def wait_for_mount(dev, seconds):
+    for _ in range(seconds):
+        mnt = mount_target_of(dev)
+        if mnt:
+            return mnt
+        time.sleep(1)
+    return None
+
+
+def acquire_mount(dev):
+    """Use the desktop automounter's mount if it shows up; otherwise mount it
+    ourselves. Returns (mountpoint, we_mounted) or (None, False)."""
+    mnt = wait_for_mount(dev, 10)  # give GNOME/udisks first shot
+    if mnt:
+        return mnt, False
+    target = str(MOUNT_BASE / os.path.basename(dev))
+    os.makedirs(target, exist_ok=True)
+    for attempt in range(1, 4):
+        r = run(["mount", "-o", "rw,noatime", dev, target])
+        if r.returncode == 0:
+            return target, True
+        # Lost a race with the automounter? Then just use its mount.
+        mnt = wait_for_mount(dev, 5)
+        if mnt:
+            try:
+                os.rmdir(target)
+            except OSError:
+                pass
+            return mnt, False
+        log(f"Mount attempt {attempt} failed: {r.stderr.strip()}")
+    try:
+        os.rmdir(target)
+    except OSError:
+        pass
+    log(f"Could not mount {dev}, giving up.")
+    return None, False
+
+
 def handle_device(dev):
     dev = os.path.realpath(dev)
     uuid = run(["blkid", "-s", "UUID", "-o", "value", dev]).stdout.strip().lower()
@@ -211,18 +249,9 @@ def handle_device(dev):
         log(f"{dev} is the media library drive, skipping.")
         return 0
 
-    time.sleep(3)  # let any desktop automounter win the race first
-    mnt = mount_target_of(dev)
-    we_mounted = False
+    mnt, we_mounted = acquire_mount(dev)
     if not mnt:
-        mnt = str(MOUNT_BASE / os.path.basename(dev))
-        os.makedirs(mnt, exist_ok=True)
-        r = run(["mount", "-o", "rw,noatime", dev, mnt])
-        if r.returncode != 0:
-            log(f"Could not mount {dev}: {r.stderr.strip()}")
-            os.rmdir(mnt)
-            return 1
-        we_mounted = True
+        return 1
     log(f"{dev} mounted at {mnt}")
 
     try:
