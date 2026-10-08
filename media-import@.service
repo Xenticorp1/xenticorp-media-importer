@@ -1,0 +1,9 @@
+[Unit]
+Description=Xenticorp Media Import from /dev/%I
+BindsTo=dev-%i.device
+After=dev-%i.device local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/media-import/media_import.py /dev/%I
+TimeoutStartSec=infinity
