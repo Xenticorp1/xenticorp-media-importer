@@ -1,2 +1,4 @@
-# Xenticorp Media Import: start the importer when a USB filesystem appears
-ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd*", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="media-import@%k.service"
+# Xenticorp Media Import: start the importer when a USB filesystem appears.
+# SUBSYSTEMS=="usb" checks the drive really hangs off the USB bus. ENV{ID_BUS} isn't used because SSD
+# enclosures often pass the SSD's own identity through, so it says "ata" even over USB.
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd*", SUBSYSTEMS=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="media-import@%k.service"

@@ -339,14 +339,16 @@ def wait_for_mount(dev, seconds):
 
 def acquire_mount(dev):
     """Use the desktop automounter's mount if it shows up; otherwise mount it
-    ourselves. Returns (mountpoint, we_mounted) or (None, False)."""
+    ourselves, read-only (handle_device switches it to read-write only if it has
+    media, so other partitions, e.g. Windows ones on an SSD, are never written).
+    Returns (mountpoint, we_mounted) or (None, False)."""
     mnt = wait_for_mount(dev, 10)  # give GNOME/udisks first shot
     if mnt:
         return mnt, False
     target = str(MOUNT_BASE / os.path.basename(dev))
     os.makedirs(target, exist_ok=True)
     for attempt in range(1, 4):
-        r = run(["mount", "-o", "rw,noatime", dev, target])
+        r = run(["mount", "-o", "ro,noatime", dev, target])
         if r.returncode == 0:
             return target, True
         # Lost a race with the automounter? Then just use its mount.
@@ -386,6 +388,15 @@ def handle_device(dev):
     log(f"{dev} mounted at {mnt}")
 
     try:
+        if we_mounted and (Path(mnt) / SOURCE_FOLDER).is_dir():
+            # Unmount and mount again read-write. (An in-place "remount,rw" isn't supported
+            # by every filesystem driver, e.g. FUSE exFAT.)
+            run(["umount", mnt])
+            r = run(["mount", "-o", "rw,noatime", dev, mnt])
+            if r.returncode != 0:
+                log(f"Could not remount {dev} read-write: {r.stderr.strip()}")
+                STATUS.finish("mount_failed", "Couldn't mount the drive read-write")
+                return 1
         return import_media(Path(mnt))
     finally:
         if we_mounted:  # put things back the way we found them
