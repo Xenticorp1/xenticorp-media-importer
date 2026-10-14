@@ -46,6 +46,7 @@ MOUNT_BASE = Path("/run/media-import")
 LOCK_FILE = "/run/media-import.lock"
 CHUNK = 8 * 1024 * 1024
 STATUS_FILE = Path("/var/lib/media-import/status.json")  # read by the dashboard
+SYS_BLOCK = Path("/sys/class/block")
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 # Episode codes like S01E01 / s1e1 / 1x01; loose files matching this aren't movies.
 EPISODE_RE = re.compile(r"(?i)(?<![a-z0-9])(s\d{1,2}\s*e\d{1,3}|\d{1,2}x\d{2,3})(?![0-9])")
@@ -61,14 +62,32 @@ class Status:
     A heartbeat thread rewrites it every few seconds while a run is going, so a reader can
     tell a run that died (stale "updated") from one that's just copying a big file."""
 
+    # A drive with several partitions runs the importer once per partition, one after another.
+    # Results that just mean "no media on this partition" stay quiet when another partition of the
+    # same drive, still plugged in, already reported something real (e.g. its import finished).
+    QUIET_RESULTS = (None, "no_folder", "nothing", "mount_failed")
+
     def __init__(self):
         self.data = None
+        self.quiet = False
         self.lock = threading.Lock()
         self.last_write = 0
 
     def start(self, device, label):
         now = int(time.time())
-        self.data = {"v": 1, "state": "plugged_in", "step": "mounting", "device": device,
+        disk = device
+        if device:
+            parent = os.path.basename(os.path.realpath(SYS_BLOCK / device / ".."))
+            if parent != "block":  # a partition: its parent is the whole disk (sdb4 -> sdb)
+                disk = parent
+            try:
+                prev = json.loads(STATUS_FILE.read_text())
+                self.quiet = (prev.get("disk") == disk and prev.get("device") != device
+                              and prev.get("result") not in self.QUIET_RESULTS
+                              and (SYS_BLOCK / str(prev.get("device"))).exists())
+            except (OSError, ValueError, AttributeError):
+                pass
+        self.data = {"v": 1, "state": "plugged_in", "step": "mounting", "device": device, "disk": disk,
                      "label": label or None, "started": now, "updated": now, "finished": None,
                      "total": 0, "index": 0, "file": None, "bytes_total": 0, "bytes_done": 0,
                      "imported": 0, "failed": 0, "skipped": 0, "failed_files": [],
@@ -91,6 +110,8 @@ class Status:
 
     def write(self, force=False):
         if self.data is None or (not force and time.monotonic() - self.last_write < 1):
+            return
+        if self.quiet and self.data["state"] != "running" and self.data["result"] in self.QUIET_RESULTS:
             return
         with self.lock:
             self.data["updated"] = int(time.time())

@@ -37,7 +37,8 @@ While it runs, the importer keeps `/var/lib/media-import/status.json` up to date
 `result` of `ok`, `problems`, `no_folder`, `nothing`, `aborted`, `mount_failed`, `interrupted` or
 `error`, plus counts and a message). It's rewritten every 5 seconds during a run, so a stale
 `updated` time means the importer died. The Xenticorp dashboard reads it to show the import status.
-Drives on the ignore list and the library drive never touch it.
+Drives on the ignore list and the library drive never touch it. On a drive with several partitions,
+partitions with no media don't overwrite a sibling partition's result while that drive is plugged in.
 
 ## Logs / manual run
 
