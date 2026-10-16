@@ -8,12 +8,22 @@ Runs when a USB drive is plugged in (via udev -> systemd). If the drive has a
   Compressed Media/Movie.mkv              -> <library>/movies/Movie.mkv
   Compressed Media/<Show>/Season 01/...   -> <library>/shows/<Show>/Season 01/...
 
+Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.json):
+- Ripped Media: import the "Ripped Media" folder instead, the same way.
+- Library drive mode: the drive is laid out like a library. Everything in its
+  Movies/ and Shows/ folders (videos, subtitles, artwork, .nfo...) is copied:
+    Movies/<Movie (Year)>/...             -> <library>/movies/<Movie (Year)>/...
+    Shows/<Show>/Season 01/...            -> <library>/shows/<Show>/Season 01/...
+  Nothing on the drive is changed or deleted; it's only ever mounted read-only.
+- Skip files already in the library (works in every mode; see below).
+
 - Loose .mkv / .mp4 files at the root count as movies; other loose files are ignored.
 - A show folder is matched to an existing library show by name. Case, punctuation
   and a trailing "(YYYY)" / "[tmdbid-...]" tag are ignored, so "Breaking Bad"
   lands in "Breaking Bad (2008)" if that's the existing one. If nothing matches,
   a new show folder is created.
-- Every file is copied, verified by SHA-256, and only then deleted from the USB.
+- Every file is copied, verified by SHA-256, and only then deleted from the USB
+  (except in library drive mode, which keeps everything on the drive).
   Folders emptied by the import are removed; folders that were already empty
   (e.g. a blank "Season 2") stay on the USB, and so does their show folder.
 - If the file already exists in the library, it is overwritten. With skip-existing
@@ -41,7 +51,8 @@ from pathlib import Path
 LIBRARY_ROOT = Path("/mnt/media/jellyfin/media")
 MOVIES_DIR = LIBRARY_ROOT / "movies"
 SHOWS_DIR = LIBRARY_ROOT / "shows"
-SOURCE_FOLDER = "Compressed Media"
+SOURCE_FOLDERS = {"compressed": "Compressed Media", "ripped": "Ripped Media"}  # picked on the dashboard
+LIBRARY_FOLDERS = {"movies": "Movies", "shows": "Shows"}  # library drive mode; case doesn't matter
 MOVIE_EXTS = {".mkv", ".mp4"}
 IGNORE_UUIDS_FILE = Path("/etc/media-import/ignore-uuids")  # drives never touched
 MOUNT_BASE = Path("/run/media-import")
@@ -94,7 +105,7 @@ class Status:
                      "label": label or None, "started": now, "updated": now, "finished": None,
                      "total": 0, "index": 0, "file": None, "bytes_total": 0, "bytes_done": 0,
                      "imported": 0, "failed": 0, "skipped": 0, "existing": 0, "failed_files": [],
-                     "result": None, "message": None}
+                     "mode": None, "result": None, "message": None}
         self.write(force=True)
         threading.Thread(target=self._beat, daemon=True).start()
 
@@ -142,15 +153,24 @@ def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def skip_existing():
-    """Skip-existing mode, from the dashboard's settings file. Off if the file is missing or unreadable."""
+def load_settings():
+    """The dashboard's switches. Anything missing or unreadable gets the default:
+    Compressed Media, library drive mode off, existing library files overwritten."""
+    settings = {"source": "compressed", "library_drive": False, "skip_existing": False}
     try:
-        return json.loads(SETTINGS_FILE.read_text()).get("skip_existing") is True
+        raw = json.loads(SETTINGS_FILE.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError("not a JSON object")
     except FileNotFoundError:
-        return False
-    except (OSError, ValueError, AttributeError) as e:
-        log(f"(couldn't read {SETTINGS_FILE}, skip-existing mode is off: {e})")
-        return False
+        return settings
+    except (OSError, ValueError) as e:
+        log(f"(couldn't read {SETTINGS_FILE}, using the defaults: {e})")
+        return settings
+    if raw.get("source") in SOURCE_FOLDERS:
+        settings["source"] = raw["source"]
+    settings["library_drive"] = raw.get("library_drive") is True
+    settings["skip_existing"] = raw.get("skip_existing") is True
+    return settings
 
 
 def mount_target_of(dev):
@@ -195,7 +215,16 @@ def sha256_file(path, drop_cache=False):
     return h.hexdigest()
 
 
-def copy_verify_delete(src: Path, dst: Path):
+def walk_files(top):
+    """Every file under top (sorted, junk left out)."""
+    for dirpath, dirnames, filenames in os.walk(top):
+        dirnames[:] = sorted(n for n in dirnames if not is_junk(n))
+        for fn in sorted(filenames):
+            if not is_junk(fn):
+                yield Path(dirpath) / fn
+
+
+def copy_verify_delete(src: Path, dst: Path, delete=True):
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(f".{dst.name}.importing")
     h = hashlib.sha256()
@@ -220,29 +249,14 @@ def copy_verify_delete(src: Path, dst: Path):
         os.utime(dst, (st.st_atime, st.st_mtime))
     except OSError:
         pass
-    src.unlink()
+    if delete:
+        src.unlink()
 
 
-def import_media(root: Path):
-    STATUS.update(step="scanning", force=True)
-    src_dir = root / SOURCE_FOLDER
-    if not src_dir.is_dir():
-        log(f"No '{SOURCE_FOLDER}' folder on {root}, nothing to do.")
-        STATUS.finish("no_folder", f"No '{SOURCE_FOLDER}' folder on this drive")
-        return 0
-
-    for d in (MOVIES_DIR, SHOWS_DIR):
-        if not d.is_dir():
-            log(f"ABORT: library folder missing: {d} (is the media drive mounted?)")
-            STATUS.finish("aborted", "The library drive isn't mounted, so nothing was imported")
-            return 2
-    if fs_of(LIBRARY_ROOT, "TARGET") == "/":
-        log(f"ABORT: {LIBRARY_ROOT} is on the root filesystem; media drive not mounted?")
-        STATUS.finish("aborted", "The library drive isn't mounted, so nothing was imported")
-        return 2
-
-    jobs = []  # (src, dst)
-    skipped = 0  # misplaced episodes left on the USB
+def scan_media_folder(src_dir):
+    """Compressed / Ripped Media: loose videos are movies, folders are shows.
+    Returns (jobs, skipped misplaced episodes)."""
+    jobs, skipped = [], 0
     for entry in sorted(src_dir.iterdir(), key=lambda p: p.name.lower()):
         if is_junk(entry.name):
             continue
@@ -258,70 +272,43 @@ def import_media(root: Path):
         elif entry.is_dir():
             show_dir, exists = find_show_dir(entry.name)
             log(f"Show '{entry.name}' -> {show_dir} ({'existing' if exists else 'new'})")
-            for dirpath, dirnames, filenames in os.walk(entry):
-                dirnames[:] = sorted(n for n in dirnames if not is_junk(n))
-                for fn in sorted(filenames):
-                    if is_junk(fn):
-                        continue
-                    s = Path(dirpath) / fn
-                    jobs.append((s, show_dir / s.relative_to(entry)))
+            for s in walk_files(entry):
+                jobs.append((s, show_dir / s.relative_to(entry)))
+    return jobs, skipped
 
-    existing = 0  # already in the library, left on the USB (skip-existing mode)
-    if jobs and skip_existing():
-        log("Skip-existing mode is on: files already in the library stay on the USB.")
-        keep = []
-        for s, d in jobs:
-            if d.exists():
-                log(f"Skipping '{s.relative_to(src_dir)}': already in the library")
-                existing += 1
-            else:
-                keep.append((s, d))
-        jobs = keep
-    left_note = (f"{existing} file{'s' if existing != 1 else ''} already in the library, left on the drive"
-                 if existing else None)
 
-    if not jobs:
-        log("Nothing to import.")
-        if skipped or existing:
-            log(f"Done: 0 imported, 0 failed, {skipped} skipped (misplaced episodes)"
-                + (f", {existing} already in the library." if existing else "."))
-            STATUS.update(skipped=skipped, existing=existing)
-        if skipped:
-            why = [f"{skipped} loose episode file{'s' if skipped != 1 else ''} skipped; put them in a show folder"]
-            if left_note:
-                why.append(left_note)
-            STATUS.finish("problems", "; ".join(why))
-            return 1
-        if existing:
-            STATUS.finish("ok", left_note)
-            return 0
-        STATUS.finish("nothing", f"The '{SOURCE_FOLDER}' folder is empty")
-        return 0
+def library_folders(root):
+    """Library drive mode: the drive's Movies/ and Shows/ folders, as {"movies": path, "shows": path}."""
+    found = {}
+    for entry in sorted(root.iterdir(), key=lambda p: p.name):
+        for kind, name in LIBRARY_FOLDERS.items():
+            if kind not in found and entry.name.lower() == name.lower() and entry.is_dir():
+                found[kind] = entry
+    return found
 
-    total_bytes = 0
-    for s, _ in jobs:
-        try:
-            total_bytes += s.stat().st_size
-        except OSError:
-            pass
-    STATUS.update(state="running", step="copying", total=len(jobs), skipped=skipped, existing=existing,
-                  bytes_total=total_bytes, force=True)
 
-    ok, failed = 0, []
-    for i, (s, d) in enumerate(jobs, 1):
-        rel = s.relative_to(src_dir)
-        STATUS.update(index=i, file=str(rel), step="copying", force=True)
-        try:
-            action = "overwrite" if d.exists() else "copy"
-            log(f"[{i}/{len(jobs)}] {action}: {rel} -> {d}")
-            copy_verify_delete(s, d)
-            ok += 1
-            STATUS.update(imported=ok)
-        except Exception as e:
-            log(f"  FAILED: {rel}: {e} (left on USB)")
-            failed.append(rel)
-            STATUS.update(failed=len(failed), failed_files=[str(f) for f in failed[:10]], force=True)
+def scan_library_drive(found):
+    """Library drive mode: every file, folders kept. Movies/X/... -> movies/X/...; a show folder
+    is matched to an existing library show like in the other modes."""
+    jobs = []
+    if "movies" in found:
+        for s in walk_files(found["movies"]):
+            jobs.append((s, MOVIES_DIR / s.relative_to(found["movies"])))
+    if "shows" in found:
+        for entry in sorted(found["shows"].iterdir(), key=lambda p: p.name.lower()):
+            if is_junk(entry.name):
+                continue
+            if not entry.is_dir():
+                log(f"Skipping '{found['shows'].name}/{entry.name}': not inside a show folder")
+                continue
+            show_dir, exists = find_show_dir(entry.name)
+            log(f"Show '{entry.name}' -> {show_dir} ({'existing' if exists else 'new'})")
+            for s in walk_files(entry):
+                jobs.append((s, show_dir / s.relative_to(entry)))
+    return jobs
 
+
+def clean_up_emptied(src_dir, jobs):
     STATUS.update(step="cleaning up", file=None, force=True)
     # Remove USB folders that this run emptied (deepest first). Folders that were
     # already empty (e.g. a blank "Season 2") are never in this set, so they stay.
@@ -341,6 +328,103 @@ def import_media(root: Path):
                 log(f"Removed emptied folder: {d.relative_to(src_dir)}")
         except OSError as e:
             log(f"  Could not remove {d}: {e}")
+
+
+def import_media(root: Path, settings=None):
+    settings = settings or load_settings()
+    library = settings["library_drive"]
+    folder = SOURCE_FOLDERS[settings["source"]]
+    STATUS.update(step="scanning", mode="library" if library else settings["source"], force=True)
+    if library:
+        found = library_folders(root)
+        if not found:
+            log(f"Library drive mode: no Movies or Shows folder on {root}, nothing to do.")
+            STATUS.finish("no_folder", "Library drive mode is on, but this drive has no Movies or Shows folder")
+            return 0
+        base = root  # for the paths in the log
+        where = " and ".join(f"'{p.name}'" for p in found.values())
+        log(f"Library drive mode: copying {where}; nothing on the drive is deleted.")
+    else:
+        base = src_dir = root / folder
+        if not src_dir.is_dir():
+            log(f"No '{folder}' folder on {root}, nothing to do.")
+            STATUS.finish("no_folder", f"No '{folder}' folder on this drive")
+            return 0
+
+    for d in (MOVIES_DIR, SHOWS_DIR):
+        if not d.is_dir():
+            log(f"ABORT: library folder missing: {d} (is the media drive mounted?)")
+            STATUS.finish("aborted", "The library drive isn't mounted, so nothing was imported")
+            return 2
+    if fs_of(LIBRARY_ROOT, "TARGET") == "/":
+        log(f"ABORT: {LIBRARY_ROOT} is on the root filesystem; media drive not mounted?")
+        STATUS.finish("aborted", "The library drive isn't mounted, so nothing was imported")
+        return 2
+
+    if library:
+        jobs, skipped = scan_library_drive(found), 0  # (src, dst); skipped = misplaced episodes
+    else:
+        jobs, skipped = scan_media_folder(src_dir)
+
+    existing = 0  # already in the library, left on the USB (skip-existing mode)
+    if jobs and settings["skip_existing"]:
+        log("Skip-existing mode is on: files already in the library aren't copied.")
+        keep = []
+        for s, d in jobs:
+            if d.exists():
+                log(f"Skipping '{s.relative_to(base)}': already in the library")
+                existing += 1
+            else:
+                keep.append((s, d))
+        jobs = keep
+    left_note = (f"{existing} file{'s' if existing != 1 else ''} already in the library"
+                 + (", not copied" if library else ", left on the drive") if existing else None)
+
+    if not jobs:
+        log("Nothing to import.")
+        if skipped or existing:
+            log(f"Done: 0 imported, 0 failed, {skipped} skipped (misplaced episodes)"
+                + (f", {existing} already in the library." if existing else "."))
+            STATUS.update(skipped=skipped, existing=existing)
+        if skipped:
+            why = [f"{skipped} loose episode file{'s' if skipped != 1 else ''} skipped; put them in a show folder"]
+            if left_note:
+                why.append(left_note)
+            STATUS.finish("problems", "; ".join(why))
+            return 1
+        if existing:
+            STATUS.finish("ok", left_note)
+            return 0
+        STATUS.finish("nothing", f"Nothing in this drive's {where} folder{'s' if len(found) > 1 else ''}"
+                      if library else f"The '{folder}' folder is empty")
+        return 0
+
+    total_bytes = 0
+    for s, _ in jobs:
+        try:
+            total_bytes += s.stat().st_size
+        except OSError:
+            pass
+    STATUS.update(state="running", step="copying", total=len(jobs), skipped=skipped, existing=existing,
+                  bytes_total=total_bytes, force=True)
+
+    ok, failed = 0, []
+    for i, (s, d) in enumerate(jobs, 1):
+        rel = s.relative_to(base)
+        STATUS.update(index=i, file=str(rel), step="copying", force=True)
+        try:
+            action = "overwrite" if d.exists() else "copy"
+            log(f"[{i}/{len(jobs)}] {action}: {rel} -> {d}")
+            copy_verify_delete(s, d, delete=not library)
+            ok += 1
+            STATUS.update(imported=ok)
+        except Exception as e:
+            log(f"  FAILED: {rel}: {e} (left on USB)")
+            failed.append(rel)
+            STATUS.update(failed=len(failed), failed_files=[str(f) for f in failed[:10]], force=True)
+
+    if not library:  # library drive mode deletes nothing, so there's nothing to tidy up
+        clean_up_emptied(src_dir, jobs)
 
     os.sync()
     log(f"Done: {ok} imported, {len(failed)} failed, {skipped} skipped (misplaced episodes)"
@@ -426,8 +510,11 @@ def handle_device(dev):
         return 1
     log(f"{dev} mounted at {mnt}")
 
+    settings = load_settings()
+    # Library drive mode only reads the drive, so it stays read-only.
+    needs_write = not settings["library_drive"] and (Path(mnt) / SOURCE_FOLDERS[settings["source"]]).is_dir()
     try:
-        if we_mounted and (Path(mnt) / SOURCE_FOLDER).is_dir():
+        if we_mounted and needs_write:
             # Unmount and mount again read-write. (An in-place "remount,rw" isn't supported
             # by every filesystem driver, e.g. FUSE exFAT.)
             run(["umount", mnt])
@@ -436,7 +523,7 @@ def handle_device(dev):
                 log(f"Could not remount {dev} read-write: {r.stderr.strip()}")
                 STATUS.finish("mount_failed", "Couldn't mount the drive read-write")
                 return 1
-        return import_media(Path(mnt))
+        return import_media(Path(mnt), settings)
     finally:
         if we_mounted:  # put things back the way we found them
             run(["umount", mnt])
