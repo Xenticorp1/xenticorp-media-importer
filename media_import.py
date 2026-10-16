@@ -15,6 +15,8 @@ Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.jso
     Movies/<Movie (Year)>/...             -> <library>/movies/<Movie (Year)>/...
     Shows/<Show>/Season 01/...            -> <library>/shows/<Show>/Season 01/...
   Nothing on the drive is changed or deleted; it's only ever mounted read-only.
+  The run then waits for the dashboard: you reject the movies/shows you don't
+  want and approve, and only the rest is copied.
 - Skip files already in the library (works in every mode; see below).
 
 - Loose .mkv / .mp4 files at the root count as movies; other loose files are ignored.
@@ -40,6 +42,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -60,6 +63,7 @@ LOCK_FILE = "/run/media-import.lock"
 CHUNK = 8 * 1024 * 1024
 STATUS_FILE = Path("/var/lib/media-import/status.json")  # read by the dashboard
 SETTINGS_FILE = Path("/var/lib/media-import/settings.json")  # written by the dashboard
+REVIEW_FILE = Path("/var/lib/media-import/review.json")  # library drive mode: the dashboard's approval
 SYS_BLOCK = Path("/sys/class/block")
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 # Episode codes like S01E01 / s1e1 / 1x01; loose files matching this aren't movies.
@@ -105,7 +109,7 @@ class Status:
                      "label": label or None, "started": now, "updated": now, "finished": None,
                      "total": 0, "index": 0, "file": None, "bytes_total": 0, "bytes_done": 0,
                      "imported": 0, "failed": 0, "skipped": 0, "existing": 0, "failed_files": [],
-                     "mode": None, "result": None, "message": None}
+                     "mode": None, "items": [], "run_id": None, "rejected": 0, "result": None, "message": None}
         self.write(force=True)
         threading.Thread(target=self._beat, daemon=True).start()
 
@@ -125,7 +129,8 @@ class Status:
     def write(self, force=False):
         if self.data is None or (not force and time.monotonic() - self.last_write < 1):
             return
-        if self.quiet and self.data["state"] != "running" and self.data["result"] in self.QUIET_RESULTS:
+        if (self.quiet and self.data["state"] not in ("running", "review")
+                and self.data["result"] in self.QUIET_RESULTS):
             return
         with self.lock:
             self.data["updated"] = int(time.time())
@@ -253,9 +258,24 @@ def copy_verify_delete(src: Path, dst: Path, delete=True):
         src.unlink()
 
 
-def scan_media_folder(src_dir):
+def add_item(items, kind, name, **extra):
+    """One movie or show in the dashboard's list (items: id -> item, in drive order). Returns its id."""
+    iid = f"{kind}:{name}"
+    if iid not in items:
+        items[iid] = {"id": iid, "kind": kind, "name": name, "files": 0, "bytes": 0, "existing": 0,
+                      "copy": 0, "done": 0, "failed": 0, "state": "waiting", **extra}
+    return iid
+
+
+def add_show(items, entry):
+    show_dir, exists = find_show_dir(entry.name)
+    log(f"Show '{entry.name}' -> {show_dir} ({'existing' if exists else 'new'})")
+    return show_dir, add_item(items, "show", entry.name, target=show_dir.name, new=not exists)
+
+
+def scan_media_folder(src_dir, items):
     """Compressed / Ripped Media: loose videos are movies, folders are shows.
-    Returns (jobs, skipped misplaced episodes)."""
+    Returns (jobs as (src, dst, item id), skipped misplaced episodes)."""
     jobs, skipped = [], 0
     for entry in sorted(src_dir.iterdir(), key=lambda p: p.name.lower()):
         if is_junk(entry.name):
@@ -266,14 +286,13 @@ def scan_media_folder(src_dir):
                     log(f"Skipping '{entry.name}': looks like a TV episode, put it in a show folder")
                     skipped += 1
                     continue
-                jobs.append((entry, MOVIES_DIR / entry.name))
+                jobs.append((entry, MOVIES_DIR / entry.name, add_item(items, "movie", entry.stem)))
             else:
                 log(f"Skipping non-video file: {entry.name}")
         elif entry.is_dir():
-            show_dir, exists = find_show_dir(entry.name)
-            log(f"Show '{entry.name}' -> {show_dir} ({'existing' if exists else 'new'})")
+            show_dir, iid = add_show(items, entry)
             for s in walk_files(entry):
-                jobs.append((s, show_dir / s.relative_to(entry)))
+                jobs.append((s, show_dir / s.relative_to(entry), iid))
     return jobs, skipped
 
 
@@ -287,13 +306,20 @@ def library_folders(root):
     return found
 
 
-def scan_library_drive(found):
+def scan_library_drive(found, items):
     """Library drive mode: every file, folders kept. Movies/X/... -> movies/X/...; a show folder
-    is matched to an existing library show like in the other modes."""
+    is matched to an existing library show like in the other modes. Each folder in Movies/ is one
+    movie; a loose file there belongs to the loose video its name starts with (Heat.en.srt -> Heat)."""
     jobs = []
     if "movies" in found:
-        for s in walk_files(found["movies"]):
-            jobs.append((s, MOVIES_DIR / s.relative_to(found["movies"])))
+        movies = found["movies"]
+        stems = sorted((e.stem for e in movies.iterdir() if e.is_file() and e.suffix.lower() in MOVIE_EXTS),
+                       key=len, reverse=True)  # longest first, so "Heat 2" wins over "Heat"
+        for s in walk_files(movies):
+            rel = s.relative_to(movies)
+            name = rel.parts[0] if len(rel.parts) > 1 else next(
+                (st for st in stems if s.name.startswith(st)), s.stem)
+            jobs.append((s, MOVIES_DIR / rel, add_item(items, "movie", name)))
     if "shows" in found:
         for entry in sorted(found["shows"].iterdir(), key=lambda p: p.name.lower()):
             if is_junk(entry.name):
@@ -301,11 +327,35 @@ def scan_library_drive(found):
             if not entry.is_dir():
                 log(f"Skipping '{found['shows'].name}/{entry.name}': not inside a show folder")
                 continue
-            show_dir, exists = find_show_dir(entry.name)
-            log(f"Show '{entry.name}' -> {show_dir} ({'existing' if exists else 'new'})")
+            show_dir, iid = add_show(items, entry)
             for s in walk_files(entry):
-                jobs.append((s, show_dir / s.relative_to(entry)))
+                jobs.append((s, show_dir / s.relative_to(entry), iid))
     return jobs
+
+
+def wait_for_review(items):
+    """Library drive mode: show the list on the dashboard and wait until it's approved there.
+    Returns the rejected item ids, or None if the run was cancelled."""
+    run_id = secrets.token_hex(8)
+    REVIEW_FILE.unlink(missing_ok=True)
+    STATUS.update(state="review", step="waiting for approval", run_id=run_id, force=True)
+    log("Library drive mode: waiting for approval on the dashboard...")
+    while True:
+        time.sleep(1)
+        try:
+            review = json.loads(REVIEW_FILE.read_text())
+        except (OSError, ValueError):
+            continue  # not answered yet (the dashboard writes the file in one go)
+        if not isinstance(review, dict) or review.get("run_id") != run_id:
+            continue  # left over from another run
+        REVIEW_FILE.unlink(missing_ok=True)
+        if review.get("cancel") is True:
+            log("Cancelled on the dashboard.")
+            return None
+        rejected = {r for r in review.get("rejected") or [] if isinstance(r, str) and r in items}
+        for iid in rejected:
+            log(f"Rejected on the dashboard: {items[iid]['name']}")
+        return rejected
 
 
 def clean_up_emptied(src_dir, jobs):
@@ -313,7 +363,7 @@ def clean_up_emptied(src_dir, jobs):
     # Remove USB folders that this run emptied (deepest first). Folders that were
     # already empty (e.g. a blank "Season 2") are never in this set, so they stay.
     emptied = set()
-    for s, _ in jobs:
+    for s, *_ in jobs:
         p = s.parent
         while p != src_dir:
             emptied.add(p)
@@ -361,22 +411,54 @@ def import_media(root: Path, settings=None):
         STATUS.finish("aborted", "The library drive isn't mounted, so nothing was imported")
         return 2
 
+    items = {}  # the movies and shows found, for the dashboard
     if library:
-        jobs, skipped = scan_library_drive(found), 0  # (src, dst); skipped = misplaced episodes
+        jobs, skipped = scan_library_drive(found, items), 0  # (src, dst, item id); skipped = misplaced episodes
     else:
-        jobs, skipped = scan_media_folder(src_dir)
+        jobs, skipped = scan_media_folder(src_dir, items)
 
     existing = 0  # already in the library, left on the USB (skip-existing mode)
     if jobs and settings["skip_existing"]:
         log("Skip-existing mode is on: files already in the library aren't copied.")
-        keep = []
-        for s, d in jobs:
-            if d.exists():
-                log(f"Skipping '{s.relative_to(base)}': already in the library")
-                existing += 1
-            else:
-                keep.append((s, d))
-        jobs = keep
+    keep = []
+    for s, d, iid in jobs:
+        item = items[iid]
+        item["files"] += 1
+        if settings["skip_existing"] and d.exists():
+            log(f"Skipping '{s.relative_to(base)}': already in the library")
+            existing += 1
+            item["existing"] += 1
+            continue
+        try:
+            item["bytes"] += s.stat().st_size
+        except OSError:
+            pass
+        item["copy"] += 1
+        keep.append((s, d, iid))
+    jobs = keep
+    items = dict(sorted(items.items(), key=lambda kv: (kv[1]["kind"] != "movie", kv[1]["name"].lower())))
+    for item in items.values():
+        if not item["copy"]:
+            item["state"] = "in_library"
+    STATUS.update(items=list(items.values()), existing=existing, force=True)
+
+    rejected = set()
+    if library and jobs:
+        rejected = wait_for_review(items)
+        if rejected is None:
+            for item in items.values():
+                if item["state"] == "waiting":
+                    item["state"] = "rejected"
+            STATUS.finish("cancelled", "Cancelled on the dashboard; nothing was copied")
+            return 0
+        for iid in rejected:
+            items[iid]["state"] = "rejected"
+        jobs = [j for j in jobs if j[2] not in rejected]
+        STATUS.update(state="plugged_in", step="scanning", rejected=len(rejected), force=True)
+        if not jobs:
+            log("Everything was rejected; nothing to copy.")
+            STATUS.finish("cancelled", "Everything was rejected on the dashboard; nothing was copied")
+            return 0
     left_note = (f"{existing} file{'s' if existing != 1 else ''} already in the library"
                  + (", not copied" if library else ", left on the drive") if existing else None)
 
@@ -399,29 +481,31 @@ def import_media(root: Path, settings=None):
                       if library else f"The '{folder}' folder is empty")
         return 0
 
-    total_bytes = 0
-    for s, _ in jobs:
-        try:
-            total_bytes += s.stat().st_size
-        except OSError:
-            pass
+    total_bytes = sum(item["bytes"] for item in items.values() if item["id"] not in rejected)
     STATUS.update(state="running", step="copying", total=len(jobs), skipped=skipped, existing=existing,
                   bytes_total=total_bytes, force=True)
 
     ok, failed = 0, []
-    for i, (s, d) in enumerate(jobs, 1):
+    for i, (s, d, iid) in enumerate(jobs, 1):
         rel = s.relative_to(base)
+        item = items[iid]
+        item["state"] = "copying"
         STATUS.update(index=i, file=str(rel), step="copying", force=True)
         try:
             action = "overwrite" if d.exists() else "copy"
             log(f"[{i}/{len(jobs)}] {action}: {rel} -> {d}")
             copy_verify_delete(s, d, delete=not library)
             ok += 1
+            item["done"] += 1
             STATUS.update(imported=ok)
         except Exception as e:
             log(f"  FAILED: {rel}: {e} (left on USB)")
             failed.append(rel)
+            item["failed"] += 1
             STATUS.update(failed=len(failed), failed_files=[str(f) for f in failed[:10]], force=True)
+        if item["done"] + item["failed"] == item["copy"]:
+            item["state"] = "failed" if item["failed"] else "done"
+            STATUS.update(force=True)
 
     if not library:  # library drive mode deletes nothing, so there's nothing to tidy up
         clean_up_emptied(src_dir, jobs)

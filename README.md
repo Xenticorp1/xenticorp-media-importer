@@ -28,6 +28,10 @@ when a drive is plugged in; a missing or broken file means all defaults.
   artwork and `.nfo` files alike, keeping the folders: `Movies/Heat (1995)/...` goes to
   `movies/Heat (1995)/...`, and a show folder is matched to an existing library show as above. Nothing on
   the drive is changed or deleted, so it's only mounted read-only. The source folder switch doesn't apply.
+  Before copying anything it waits for you on the dashboard: the card lists the movies and shows it found,
+  you reject the ones you don't want and press approve (or cancel), and only the rest is copied. The
+  answer comes back as `/var/lib/media-import/review.json` (`{"run_id": ..., "rejected": [ids]}` or
+  `"cancel": true`). Unplugging the drive while it waits stops the run, as always.
 - **Skip files already in the library** (`"skip_existing"`, off by default): a file whose name is already
   at its spot in the library isn't copied (in the normal modes it stays on the USB). Works in every mode.
 
@@ -52,7 +56,10 @@ While it runs, the importer keeps `/var/lib/media-import/status.json` up to date
 (mounting, scanning), `running` (file N of M, current file, bytes copied) and `finished` (with a
 `result` of `ok`, `problems`, `no_folder`, `nothing`, `aborted`, `mount_failed`, `interrupted` or
 `error`, plus counts, including `existing` for files skip-existing mode didn't copy, the `mode` (`compressed`,
-`ripped` or `library`) and a message). It's rewritten every 5 seconds during a run, so a stale
+`ripped` or `library`), the movies and shows found (`items`, one per movie or show, with file counts,
+sizes and how far each got) and a message). In library drive mode the state goes `plugged_in` ->
+`review` (waiting for approval) -> `running` -> `finished`; a cancel or rejecting everything finishes
+with `cancelled`. It's rewritten every 5 seconds during a run, so a stale
 `updated` time means the importer died. The Xenticorp dashboard reads it to show the import status.
 Drives on the ignore list and the library drive never touch it. On a drive with several partitions,
 partitions with no media don't overwrite a sibling partition's result while that drive is plugged in.
