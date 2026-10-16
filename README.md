@@ -12,7 +12,7 @@ The library paths above are examples. Set yours with `LIBRARY_ROOT` in `media_im
 
 - Show names match existing library folders ignoring case, punctuation and a trailing `(YYYY)`, so `The Big Bang Theory` goes into `The Big Bang Theory (2007)`.
 - Loose files at the root whose name contains an episode code (`S01E01`, `s1e1`, `1x01`) are not imported as movies: they're skipped, left on the USB, and the run exits non-zero so it shows as needing attention. Put them in a show folder.
-- Each file is copied, SHA-256 verified, then deleted from the USB. Existing library files are overwritten.
+- Each file is copied, SHA-256 verified, then deleted from the USB (switchable, see [Settings](#settings)). Existing library files are overwritten.
 - Folders the import empties are removed. Folders that were already empty stay on the USB.
 - The library drive is never touched (UUID ignore list). The importer refuses to run if the library isn't mounted.
 
@@ -51,6 +51,11 @@ when a drive is plugged in; a missing or broken file means all defaults.
   that don't belong to a movie are left on the USB. It applies to library drives too, both ways: a
   drive with loose movies is sorted into folders in the library, and the library goes onto a drive in
   folders. Off, movies land loose in `movies/` and other loose files are skipped, as before.
+
+- **Delete from the drive after copying** (`"delete_after"`, **on** by default): each file is deleted from
+  the USB once its copy is verified, and folders that empties are removed. Off, the import only copies:
+  everything stays on the USB, which is then only ever mounted read-only (so a drive Windows left
+  hibernated still imports). Library drive mode never deletes either way.
 
 ## Tidy library
 

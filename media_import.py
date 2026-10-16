@@ -36,7 +36,9 @@ it; --tidy --run moves. Nothing is ever overwritten.
   lands in "Breaking Bad (2008)" if that's the existing one. If nothing matches,
   a new show folder is created.
 - Every file is copied, verified by SHA-256, and only then deleted from the USB
-  (except in library drive mode, which keeps everything on the drive).
+  (unless the dashboard's "delete from the drive" switch is off, and never in
+  library drive mode, which keeps everything on the drive). With deleting off the
+  drive is only read, so it stays mounted read-only.
   Folders emptied by the import are removed; folders that were already empty
   (e.g. a blank "Season 2") stay on the USB, and so does their show folder.
 - If the file already exists in the library, it is overwritten. With skip-existing
@@ -129,7 +131,7 @@ class Status:
                      "total": 0, "index": 0, "file": None, "bytes_total": 0, "bytes_done": 0,
                      "imported": 0, "failed": 0, "skipped": 0, "existing": 0, "failed_files": [],
                      "mode": None, "items": [], "run_id": None, "rejected": 0, "exported": 0,
-                     "no_space": 0, "drive_free": None, "note": None, "result": None, "message": None}
+                     "no_space": 0, "drive_free": None, "deletes": None, "note": None, "result": None, "message": None}
         self.write(force=True)
         threading.Thread(target=self._beat, daemon=True).start()
 
@@ -184,7 +186,7 @@ def load_settings():
     """The dashboard's switches. Anything missing or unreadable gets the default:
     Compressed Media, library drive mode off, existing library files overwritten."""
     settings = {"source": "compressed", "library_drive": False, "export_library": False, "skip_existing": False,
-                "movie_folders": True}
+                "movie_folders": True, "delete_after": True}
     try:
         raw = json.loads(SETTINGS_FILE.read_text())
         if not isinstance(raw, dict):
@@ -201,6 +203,7 @@ def load_settings():
     settings["export_library"] = settings["library_drive"] and raw.get("export_library") is True
     settings["skip_existing"] = raw.get("skip_existing") is True
     settings["movie_folders"] = raw.get("movie_folders") is not False  # on unless switched off
+    settings["delete_after"] = raw.get("delete_after") is not False  # likewise; never in library drive mode
     return settings
 
 
@@ -470,8 +473,9 @@ def import_media(root: Path, settings=None):
     settings = settings or load_settings()
     library = settings["library_drive"]
     folder = SOURCE_FOLDERS[settings["source"]]
-    STATUS.update(step="scanning", mode="library" if library else settings["source"], force=True)
     export = library and settings["export_library"]
+    delete = not library and settings["delete_after"]  # delete each file from the drive once it's verified
+    STATUS.update(step="scanning", mode="library" if library else settings["source"], deletes=delete, force=True)
     if library:
         found = library_folders(root)
         if not found and not export:
@@ -559,7 +563,7 @@ def import_media(root: Path, settings=None):
             STATUS.finish("cancelled", "Everything was rejected on the dashboard; nothing was copied")
             return 0
     left_note = (f"{existing} file{'s' if existing != 1 else ''} already in the library"
-                 + (", not copied" if library else ", left on the drive") if existing else None)
+                 + (", left on the drive" if delete else ", not copied") if existing else None)
 
     if not jobs:
         log("Nothing to import.")
@@ -609,7 +613,7 @@ def import_media(root: Path, settings=None):
         try:
             action = "overwrite" if d.exists() else "copy"
             log(f"[{i}/{len(jobs)}] {action}: {rel} -> {d}")
-            copy_verify_delete(s, d, delete=not library)
+            copy_verify_delete(s, d, delete=delete)
             item["done"] += 1
             flat = MOVIES_DIR / d.name
             if not out and d.parent.parent == MOVIES_DIR and flat.is_file():
@@ -622,7 +626,7 @@ def import_media(root: Path, settings=None):
                 ok += 1
                 STATUS.update(imported=ok)
         except Exception as e:
-            log(f"  FAILED: {rel}: {e}" + ("" if out else " (left on USB)"))
+            log(f"  FAILED: {rel}: {e}" + (" (left on USB)" if delete else ""))
             failed.append(rel)
             item["failed"] += 1
             STATUS.update(failed=len(failed), failed_files=[str(f) for f in failed[:10]], force=True)
@@ -630,7 +634,7 @@ def import_media(root: Path, settings=None):
             item["state"] = "failed" if item["failed"] else "done"
             STATUS.update(force=True)
 
-    if not library:  # library drive mode deletes nothing, so there's nothing to tidy up
+    if delete:  # only folders this run emptied; nothing to tidy up when nothing was deleted
         clean_up_emptied(src_dir, jobs)
 
     os.sync()
@@ -641,7 +645,7 @@ def import_media(root: Path, settings=None):
         why = []
         if failed:
             why.append(f"{len(failed)} file{'s' if len(failed) != 1 else ''} failed"
-                       + ("" if library else " and stayed on the drive"))
+                       + (" and stayed on the drive" if delete else ""))
         if no_space:
             why.append(f"{len(no_space)} title{'s' if len(no_space) != 1 else ''} didn't fit on the drive: "
                        + ", ".join(no_space[:5]) + (", ..." if len(no_space) > 5 else ""))
@@ -727,7 +731,8 @@ def handle_device(dev):
     if settings["library_drive"]:
         needs_write = settings["export_library"]
     else:
-        needs_write = (Path(mnt) / SOURCE_FOLDERS[settings["source"]]).is_dir()
+        # Only deleting from the drive writes to it.
+        needs_write = settings["delete_after"] and (Path(mnt) / SOURCE_FOLDERS[settings["source"]]).is_dir()
     try:
         if we_mounted and needs_write:
             # Unmount and mount again read-write. (An in-place "remount,rw" isn't supported
