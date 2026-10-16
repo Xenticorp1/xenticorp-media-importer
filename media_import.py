@@ -16,7 +16,9 @@ Runs when a USB drive is plugged in (via udev -> systemd). If the drive has a
 - Every file is copied, verified by SHA-256, and only then deleted from the USB.
   Folders emptied by the import are removed; folders that were already empty
   (e.g. a blank "Season 2") stay on the USB, and so does their show folder.
-- If the file already exists in the library, it is overwritten.
+- If the file already exists in the library, it is overwritten. With skip-existing
+  mode on (a switch on the Xenticorp dashboard, saved in
+  /var/lib/media-import/settings.json), it's left on the USB instead.
 - Progress is written to /var/lib/media-import/status.json (plugged in, importing
   file N of M, finished) for the Xenticorp dashboard to show. Drives on the ignore
   list and the library drive never touch it.
@@ -46,6 +48,7 @@ MOUNT_BASE = Path("/run/media-import")
 LOCK_FILE = "/run/media-import.lock"
 CHUNK = 8 * 1024 * 1024
 STATUS_FILE = Path("/var/lib/media-import/status.json")  # read by the dashboard
+SETTINGS_FILE = Path("/var/lib/media-import/settings.json")  # written by the dashboard
 SYS_BLOCK = Path("/sys/class/block")
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 # Episode codes like S01E01 / s1e1 / 1x01; loose files matching this aren't movies.
@@ -90,7 +93,7 @@ class Status:
         self.data = {"v": 1, "state": "plugged_in", "step": "mounting", "device": device, "disk": disk,
                      "label": label or None, "started": now, "updated": now, "finished": None,
                      "total": 0, "index": 0, "file": None, "bytes_total": 0, "bytes_done": 0,
-                     "imported": 0, "failed": 0, "skipped": 0, "failed_files": [],
+                     "imported": 0, "failed": 0, "skipped": 0, "existing": 0, "failed_files": [],
                      "result": None, "message": None}
         self.write(force=True)
         threading.Thread(target=self._beat, daemon=True).start()
@@ -137,6 +140,17 @@ STATUS = Status()
 
 def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def skip_existing():
+    """Skip-existing mode, from the dashboard's settings file. Off if the file is missing or unreadable."""
+    try:
+        return json.loads(SETTINGS_FILE.read_text()).get("skip_existing") is True
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, AttributeError) as e:
+        log(f"(couldn't read {SETTINGS_FILE}, skip-existing mode is off: {e})")
+        return False
 
 
 def mount_target_of(dev):
@@ -252,13 +266,35 @@ def import_media(root: Path):
                     s = Path(dirpath) / fn
                     jobs.append((s, show_dir / s.relative_to(entry)))
 
+    existing = 0  # already in the library, left on the USB (skip-existing mode)
+    if jobs and skip_existing():
+        log("Skip-existing mode is on: files already in the library stay on the USB.")
+        keep = []
+        for s, d in jobs:
+            if d.exists():
+                log(f"Skipping '{s.relative_to(src_dir)}': already in the library")
+                existing += 1
+            else:
+                keep.append((s, d))
+        jobs = keep
+    left_note = (f"{existing} file{'s' if existing != 1 else ''} already in the library, left on the drive"
+                 if existing else None)
+
     if not jobs:
         log("Nothing to import.")
+        if skipped or existing:
+            log(f"Done: 0 imported, 0 failed, {skipped} skipped (misplaced episodes)"
+                + (f", {existing} already in the library." if existing else "."))
+            STATUS.update(skipped=skipped, existing=existing)
         if skipped:
-            log(f"Done: 0 imported, 0 failed, {skipped} skipped (misplaced episodes).")
-            STATUS.update(skipped=skipped)
-            STATUS.finish("problems", f"{skipped} loose episode file{'s' if skipped != 1 else ''} skipped; put them in a show folder")
+            why = [f"{skipped} loose episode file{'s' if skipped != 1 else ''} skipped; put them in a show folder"]
+            if left_note:
+                why.append(left_note)
+            STATUS.finish("problems", "; ".join(why))
             return 1
+        if existing:
+            STATUS.finish("ok", left_note)
+            return 0
         STATUS.finish("nothing", f"The '{SOURCE_FOLDER}' folder is empty")
         return 0
 
@@ -268,7 +304,7 @@ def import_media(root: Path):
             total_bytes += s.stat().st_size
         except OSError:
             pass
-    STATUS.update(state="running", step="copying", total=len(jobs), skipped=skipped,
+    STATUS.update(state="running", step="copying", total=len(jobs), skipped=skipped, existing=existing,
                   bytes_total=total_bytes, force=True)
 
     ok, failed = 0, []
@@ -307,16 +343,19 @@ def import_media(root: Path):
             log(f"  Could not remove {d}: {e}")
 
     os.sync()
-    log(f"Done: {ok} imported, {len(failed)} failed, {skipped} skipped (misplaced episodes).")
+    log(f"Done: {ok} imported, {len(failed)} failed, {skipped} skipped (misplaced episodes)"
+        + (f", {existing} already in the library." if existing else "."))
     if failed or skipped:
         why = []
         if failed:
             why.append(f"{len(failed)} file{'s' if len(failed) != 1 else ''} failed and stayed on the drive")
         if skipped:
             why.append(f"{skipped} loose episode file{'s' if skipped != 1 else ''} skipped; put them in a show folder")
+        if left_note:
+            why.append(left_note)
         STATUS.finish("problems", "; ".join(why))
         return 1
-    STATUS.finish("ok")
+    STATUS.finish("ok", left_note)
     return 0
 
 

@@ -12,6 +12,7 @@ The library paths above are examples. Set yours with `LIBRARY_ROOT` in `media_im
 - Show names match existing library folders ignoring case, punctuation and a trailing `(YYYY)`, so `The Big Bang Theory` goes into `The Big Bang Theory (2007)`.
 - Loose files at the root whose name contains an episode code (`S01E01`, `s1e1`, `1x01`) are not imported as movies: they're skipped, left on the USB, and the run exits non-zero so it shows as needing attention. Put them in a show folder.
 - Each file is copied, SHA-256 verified, then deleted from the USB. Existing library files are overwritten.
+- **Skip-existing mode** (a switch on the Xenticorp dashboard, saved in `/var/lib/media-import/settings.json` as `{"skip_existing": true}`): a file whose name is already at its spot in the library isn't copied and stays on the USB. Off by default, so existing files are overwritten.
 - Folders the import empties are removed. Folders that were already empty stay on the USB.
 - The library drive is never touched (UUID ignore list). The importer refuses to run if the library isn't mounted.
 
@@ -35,7 +36,7 @@ cd /path/to/media-import && git pull
 While it runs, the importer keeps `/var/lib/media-import/status.json` up to date: `plugged_in`
 (mounting, scanning), `running` (file N of M, current file, bytes copied) and `finished` (with a
 `result` of `ok`, `problems`, `no_folder`, `nothing`, `aborted`, `mount_failed`, `interrupted` or
-`error`, plus counts and a message). It's rewritten every 5 seconds during a run, so a stale
+`error`, plus counts, including `existing` for files skip-existing mode left on the drive, and a message). It's rewritten every 5 seconds during a run, so a stale
 `updated` time means the importer died. The Xenticorp dashboard reads it to show the import status.
 Drives on the ignore list and the library drive never touch it. On a drive with several partitions,
 partitions with no media don't overwrite a sibling partition's result while that drive is plugged in.
