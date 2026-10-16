@@ -17,6 +17,9 @@ Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.jso
   Nothing on the drive is changed or deleted; it's only ever mounted read-only.
   The run then waits for the dashboard: you reject the movies/shows you don't
   want and approve, and only the rest is copied.
+  Sub-switch "copy the library onto the drive": X4's library also goes the other
+  way, into the drive's Movies/ and Shows/ folders (anything not on it yet; the
+  library itself is never changed). That needs the drive read-write.
 - Skip files already in the library (works in every mode; see below).
 
 - Loose .mkv / .mp4 files at the root count as movies; other loose files are ignored.
@@ -43,6 +46,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -56,6 +60,7 @@ MOVIES_DIR = LIBRARY_ROOT / "movies"
 SHOWS_DIR = LIBRARY_ROOT / "shows"
 SOURCE_FOLDERS = {"compressed": "Compressed Media", "ripped": "Ripped Media"}  # picked on the dashboard
 LIBRARY_FOLDERS = {"movies": "Movies", "shows": "Shows"}  # library drive mode; case doesn't matter
+DRIVE_SPARE = 512 * 1024 * 1024  # copying the library onto a drive leaves at least this much free
 MOVIE_EXTS = {".mkv", ".mp4"}
 IGNORE_UUIDS_FILE = Path("/etc/media-import/ignore-uuids")  # drives never touched
 MOUNT_BASE = Path("/run/media-import")
@@ -109,7 +114,8 @@ class Status:
                      "label": label or None, "started": now, "updated": now, "finished": None,
                      "total": 0, "index": 0, "file": None, "bytes_total": 0, "bytes_done": 0,
                      "imported": 0, "failed": 0, "skipped": 0, "existing": 0, "failed_files": [],
-                     "mode": None, "items": [], "run_id": None, "rejected": 0, "result": None, "message": None}
+                     "mode": None, "items": [], "run_id": None, "rejected": 0, "exported": 0,
+                     "no_space": 0, "drive_free": None, "note": None, "result": None, "message": None}
         self.write(force=True)
         threading.Thread(target=self._beat, daemon=True).start()
 
@@ -123,6 +129,8 @@ class Status:
     def finish(self, result, message=None):
         if self.data is None or self.data["state"] == "finished":
             return
+        if self.data.get("note"):  # e.g. why the library wasn't copied onto the drive
+            message = f"{message}. {self.data['note']}" if message else self.data["note"]
         self.update(force=True, state="finished", step=None, file=None, result=result,
                     message=message, finished=int(time.time()))
 
@@ -161,7 +169,7 @@ def run(cmd):
 def load_settings():
     """The dashboard's switches. Anything missing or unreadable gets the default:
     Compressed Media, library drive mode off, existing library files overwritten."""
-    settings = {"source": "compressed", "library_drive": False, "skip_existing": False}
+    settings = {"source": "compressed", "library_drive": False, "export_library": False, "skip_existing": False}
     try:
         raw = json.loads(SETTINGS_FILE.read_text())
         if not isinstance(raw, dict):
@@ -174,6 +182,8 @@ def load_settings():
     if raw.get("source") in SOURCE_FOLDERS:
         settings["source"] = raw["source"]
     settings["library_drive"] = raw.get("library_drive") is True
+    # A sub-switch of library drive mode: means nothing without it.
+    settings["export_library"] = settings["library_drive"] and raw.get("export_library") is True
     settings["skip_existing"] = raw.get("skip_existing") is True
     return settings
 
@@ -258,13 +268,27 @@ def copy_verify_delete(src: Path, dst: Path, delete=True):
         src.unlink()
 
 
-def add_item(items, kind, name, **extra):
-    """One movie or show in the dashboard's list (items: id -> item, in drive order). Returns its id."""
-    iid = f"{kind}:{name}"
+def add_item(items, kind, name, direction="in", **extra):
+    """One movie or show in the dashboard's list (items: id -> item). direction "in" = drive -> library,
+    "out" = library -> drive (library drive mode's copy onto the drive). Returns its id."""
+    iid = f"out:{kind}:{name}" if direction == "out" else f"{kind}:{name}"
     if iid not in items:
-        items[iid] = {"id": iid, "kind": kind, "name": name, "files": 0, "bytes": 0, "existing": 0,
-                      "copy": 0, "done": 0, "failed": 0, "state": "waiting", **extra}
+        items[iid] = {"id": iid, "kind": kind, "name": name, "dir": direction, "files": 0, "bytes": 0,
+                      "existing": 0, "copy": 0, "done": 0, "failed": 0, "state": "waiting", **extra}
     return iid
+
+
+def movie_name(rel, stems):
+    """Which movie a file under a Movies folder belongs to: its top folder, or for a loose file the
+    loose video its name starts with (Heat.en.srt -> Heat). stems: loose video names, longest first."""
+    if len(rel.parts) > 1:
+        return rel.parts[0]
+    return next((st for st in stems if rel.name.startswith(st)), Path(rel.name).stem)
+
+
+def loose_video_stems(folder):
+    return sorted((e.stem for e in folder.iterdir() if e.is_file() and e.suffix.lower() in MOVIE_EXTS),
+                  key=len, reverse=True)  # longest first, so "Heat 2" wins over "Heat"
 
 
 def add_show(items, entry):
@@ -313,13 +337,10 @@ def scan_library_drive(found, items):
     jobs = []
     if "movies" in found:
         movies = found["movies"]
-        stems = sorted((e.stem for e in movies.iterdir() if e.is_file() and e.suffix.lower() in MOVIE_EXTS),
-                       key=len, reverse=True)  # longest first, so "Heat 2" wins over "Heat"
+        stems = loose_video_stems(movies)
         for s in walk_files(movies):
             rel = s.relative_to(movies)
-            name = rel.parts[0] if len(rel.parts) > 1 else next(
-                (st for st in stems if s.name.startswith(st)), s.stem)
-            jobs.append((s, MOVIES_DIR / rel, add_item(items, "movie", name)))
+            jobs.append((s, MOVIES_DIR / rel, add_item(items, "movie", movie_name(rel, stems))))
     if "shows" in found:
         for entry in sorted(found["shows"].iterdir(), key=lambda p: p.name.lower()):
             if is_junk(entry.name):
@@ -330,6 +351,33 @@ def scan_library_drive(found, items):
             show_dir, iid = add_show(items, entry)
             for s in walk_files(entry):
                 jobs.append((s, show_dir / s.relative_to(entry), iid))
+    return jobs
+
+
+def scan_library_export(root, found, items):
+    """Library drive mode's copy onto the drive: every library file that isn't on the drive yet, into
+    its Movies/ and Shows/ folders (made if missing). A library show goes into the drive's folder for
+    the same show when there is one ("Breaking Bad (2008)" -> the drive's "Breaking Bad")."""
+    jobs = []
+    drive_movies = found.get("movies") or root / LIBRARY_FOLDERS["movies"]
+    stems = loose_video_stems(MOVIES_DIR)
+    for s in walk_files(MOVIES_DIR):
+        rel = s.relative_to(MOVIES_DIR)
+        if s.name.startswith(".") or (drive_movies / rel).exists():
+            continue
+        jobs.append((s, drive_movies / rel, add_item(items, "movie", movie_name(rel, stems), "out")))
+    drive_shows = found.get("shows") or root / LIBRARY_FOLDERS["shows"]
+    on_drive = {norm_title(e.name): e for e in drive_shows.iterdir() if e.is_dir()} if drive_shows.is_dir() else {}
+    for show in sorted(SHOWS_DIR.iterdir(), key=lambda p: p.name.lower()):
+        if not show.is_dir() or is_junk(show.name) or show.name.startswith("."):
+            continue
+        target = on_drive.get(norm_title(show.name), drive_shows / show.name)
+        for s in walk_files(show):
+            d = target / s.relative_to(show)
+            if s.name.startswith(".") or d.exists():
+                continue
+            jobs.append((s, d, add_item(items, "show", show.name, "out", target=target.name,
+                                        new=not target.exists())))
     return jobs
 
 
@@ -352,7 +400,8 @@ def wait_for_review(items):
         if review.get("cancel") is True:
             log("Cancelled on the dashboard.")
             return None
-        rejected = {r for r in review.get("rejected") or [] if isinstance(r, str) and r in items}
+        rejected = {r for r in review.get("rejected") or []
+                    if isinstance(r, str) and r in items and items[r]["dir"] == "in"}
         for iid in rejected:
             log(f"Rejected on the dashboard: {items[iid]['name']}")
         return rejected
@@ -385,15 +434,17 @@ def import_media(root: Path, settings=None):
     library = settings["library_drive"]
     folder = SOURCE_FOLDERS[settings["source"]]
     STATUS.update(step="scanning", mode="library" if library else settings["source"], force=True)
+    export = library and settings["export_library"]
     if library:
         found = library_folders(root)
-        if not found:
+        if not found and not export:
             log(f"Library drive mode: no Movies or Shows folder on {root}, nothing to do.")
             STATUS.finish("no_folder", "Library drive mode is on, but this drive has no Movies or Shows folder")
             return 0
         base = root  # for the paths in the log
-        where = " and ".join(f"'{p.name}'" for p in found.values())
-        log(f"Library drive mode: copying {where}; nothing on the drive is deleted.")
+        where = " and ".join(f"'{p.name}'" for p in found.values()) or "Movies and Shows"
+        log(f"Library drive mode: copying {where}; nothing on the drive is deleted."
+            + (" The library is copied onto the drive too." if export else ""))
     else:
         base = src_dir = root / folder
         if not src_dir.is_dir():
@@ -414,6 +465,8 @@ def import_media(root: Path, settings=None):
     items = {}  # the movies and shows found, for the dashboard
     if library:
         jobs, skipped = scan_library_drive(found, items), 0  # (src, dst, item id); skipped = misplaced episodes
+        if export:  # copied after the imports; never reviewed, everything new goes onto the drive
+            jobs += scan_library_export(root, found, items)
     else:
         jobs, skipped = scan_media_folder(src_dir, items)
 
@@ -424,7 +477,7 @@ def import_media(root: Path, settings=None):
     for s, d, iid in jobs:
         item = items[iid]
         item["files"] += 1
-        if settings["skip_existing"] and d.exists():
+        if item["dir"] == "in" and settings["skip_existing"] and d.exists():
             log(f"Skipping '{s.relative_to(base)}': already in the library")
             existing += 1
             item["existing"] += 1
@@ -436,20 +489,28 @@ def import_media(root: Path, settings=None):
         item["copy"] += 1
         keep.append((s, d, iid))
     jobs = keep
-    items = dict(sorted(items.items(), key=lambda kv: (kv[1]["kind"] != "movie", kv[1]["name"].lower())))
+    items = dict(sorted(items.items(), key=lambda kv: (kv[1]["dir"] == "out", kv[1]["kind"] != "movie",
+                                                      kv[1]["name"].lower())))
     for item in items.values():
         if not item["copy"]:
             item["state"] = "in_library"
-    STATUS.update(items=list(items.values()), existing=existing, force=True)
+    drive_free = None
+    if export:
+        try:
+            drive_free = shutil.disk_usage(root).free
+        except OSError:
+            pass
+    STATUS.update(items=list(items.values()), existing=existing, drive_free=drive_free, force=True)
 
     rejected = set()
-    if library and jobs:
+    # Only what comes onto X4 is reviewed; the copy onto the drive always goes ahead.
+    if library and any(items[iid]["dir"] == "in" for _, _, iid in jobs):
         rejected = wait_for_review(items)
         if rejected is None:
             for item in items.values():
                 if item["state"] == "waiting":
                     item["state"] = "rejected"
-            STATUS.finish("cancelled", "Cancelled on the dashboard; nothing was copied")
+            STATUS.finish("cancelled", "Cancelled on the dashboard; nothing was copied either way")
             return 0
         for iid in rejected:
             items[iid]["state"] = "rejected"
@@ -477,7 +538,8 @@ def import_media(root: Path, settings=None):
         if existing:
             STATUS.finish("ok", left_note)
             return 0
-        STATUS.finish("nothing", f"Nothing in this drive's {where} folder{'s' if len(found) > 1 else ''}"
+        STATUS.finish("nothing", ("Nothing new either way: the drive and the library have the same files"
+                                  if export else f"Nothing in this drive's {where} folder{'s' if len(found) > 1 else ''}")
                       if library else f"The '{folder}' folder is empty")
         return 0
 
@@ -485,21 +547,40 @@ def import_media(root: Path, settings=None):
     STATUS.update(state="running", step="copying", total=len(jobs), skipped=skipped, existing=existing,
                   bytes_total=total_bytes, force=True)
 
-    ok, failed = 0, []
+    ok, exported, failed, no_space = 0, 0, [], []
     for i, (s, d, iid) in enumerate(jobs, 1):
-        rel = s.relative_to(base)
         item = items[iid]
+        out = item["dir"] == "out"
+        rel = Path("To the drive") / s.relative_to(LIBRARY_ROOT) if out else s.relative_to(base)
+        if item["state"] == "no_space":
+            continue
+        if out and item["state"] == "waiting":
+            # Each title only goes onto the drive if all of it fits; never a half-copied movie or show.
+            try:
+                free = shutil.disk_usage(root).free
+            except OSError:
+                free = None
+            if free is not None and item["bytes"] + DRIVE_SPARE > free:
+                log(f"Not enough space on the drive for '{item['name']}' ({item['bytes']} bytes, {free} free)")
+                item["state"] = "no_space"
+                no_space.append(item["name"])
+                STATUS.update(no_space=len(no_space), force=True)
+                continue
         item["state"] = "copying"
         STATUS.update(index=i, file=str(rel), step="copying", force=True)
         try:
             action = "overwrite" if d.exists() else "copy"
             log(f"[{i}/{len(jobs)}] {action}: {rel} -> {d}")
             copy_verify_delete(s, d, delete=not library)
-            ok += 1
             item["done"] += 1
-            STATUS.update(imported=ok)
+            if out:
+                exported += 1
+                STATUS.update(exported=exported)
+            else:
+                ok += 1
+                STATUS.update(imported=ok)
         except Exception as e:
-            log(f"  FAILED: {rel}: {e} (left on USB)")
+            log(f"  FAILED: {rel}: {e}" + ("" if out else " (left on USB)"))
             failed.append(rel)
             item["failed"] += 1
             STATUS.update(failed=len(failed), failed_files=[str(f) for f in failed[:10]], force=True)
@@ -512,11 +593,16 @@ def import_media(root: Path, settings=None):
 
     os.sync()
     log(f"Done: {ok} imported, {len(failed)} failed, {skipped} skipped (misplaced episodes)"
-        + (f", {existing} already in the library." if existing else "."))
-    if failed or skipped:
+        + (f", {existing} already in the library" if existing else "")
+        + (f", {exported} copied onto the drive, {len(no_space)} didn't fit" if export else "") + ".")
+    if failed or skipped or no_space:
         why = []
         if failed:
-            why.append(f"{len(failed)} file{'s' if len(failed) != 1 else ''} failed and stayed on the drive")
+            why.append(f"{len(failed)} file{'s' if len(failed) != 1 else ''} failed"
+                       + ("" if library else " and stayed on the drive"))
+        if no_space:
+            why.append(f"{len(no_space)} title{'s' if len(no_space) != 1 else ''} didn't fit on the drive: "
+                       + ", ".join(no_space[:5]) + (", ..." if len(no_space) > 5 else ""))
         if skipped:
             why.append(f"{skipped} loose episode file{'s' if skipped != 1 else ''} skipped; put them in a show folder")
         if left_note:
@@ -595,8 +681,11 @@ def handle_device(dev):
     log(f"{dev} mounted at {mnt}")
 
     settings = load_settings()
-    # Library drive mode only reads the drive, so it stays read-only.
-    needs_write = not settings["library_drive"] and (Path(mnt) / SOURCE_FOLDERS[settings["source"]]).is_dir()
+    # Library drive mode only reads the drive (stays read-only) unless the library is copied onto it.
+    if settings["library_drive"]:
+        needs_write = settings["export_library"]
+    else:
+        needs_write = (Path(mnt) / SOURCE_FOLDERS[settings["source"]]).is_dir()
     try:
         if we_mounted and needs_write:
             # Unmount and mount again read-write. (An in-place "remount,rw" isn't supported
@@ -605,8 +694,16 @@ def handle_device(dev):
             r = run(["mount", "-o", "rw,noatime", dev, mnt])
             if r.returncode != 0:
                 log(f"Could not remount {dev} read-write: {r.stderr.strip()}")
-                STATUS.finish("mount_failed", "Couldn't mount the drive read-write")
-                return 1
+                if not settings["library_drive"]:
+                    STATUS.finish("mount_failed", "Couldn't mount the drive read-write")
+                    return 1
+                # Library drive: still import, read-only; only the copy onto the drive is lost.
+                if run(["mount", "-o", "ro,noatime", dev, mnt]).returncode != 0:
+                    STATUS.finish("mount_failed", "Couldn't mount the drive")
+                    return 1
+                settings = {**settings, "export_library": False}
+                STATUS.update(note="Couldn't write to this drive (Windows may have left it hibernated: shut "
+                                   "Windows down fully, or run chkdsk), so the library wasn't copied onto it")
         return import_media(Path(mnt), settings)
     finally:
         if we_mounted:  # put things back the way we found them

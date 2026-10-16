@@ -18,7 +18,7 @@ The library paths above are examples. Set yours with `LIBRARY_ROOT` in `media_im
 ## Settings
 
 Three switches on the Xenticorp dashboard's Importer card, saved in `/var/lib/media-import/settings.json`
-(e.g. `{"source": "ripped", "library_drive": false, "skip_existing": true}`). The importer reads them
+(e.g. `{"source": "ripped", "library_drive": true, "export_library": true, "skip_existing": true}`). The importer reads them
 when a drive is plugged in; a missing or broken file means all defaults.
 
 - **Source folder** (`"source"`: `"compressed"`, the default, or `"ripped"`): which folder at the drive's root
@@ -32,6 +32,15 @@ when a drive is plugged in; a missing or broken file means all defaults.
   you reject the ones you don't want and press approve (or cancel), and only the rest is copied. The
   answer comes back as `/var/lib/media-import/review.json` (`{"run_id": ..., "rejected": [ids]}` or
   `"cancel": true`). Unplugging the drive while it waits stops the run, as always.
+  - **Copy the library onto the drive** (`"export_library"`, a sub-switch, off by default; ignored unless
+    library drive mode is on): for swapping media with someone. After the imports, everything in X4's
+    library that isn't on the drive yet is copied into the drive's `Movies/` and `Shows/` (made if
+    missing; a library show goes into the drive's folder for the same show, e.g. `Breaking Bad (2008)` into
+    `Breaking Bad`). Files already on the drive are never overwritten and the library is never changed.
+    These titles aren't part of the review: they're listed, but always copied (a cancel stops both ways).
+    Each title is only copied if all of it fits, leaving 512 MB free; ones that don't fit are reported.
+    This needs the drive read-write; if it can't be (e.g. Windows left it hibernated), the import still
+    runs read-only and the run says the library wasn't copied.
 - **Skip files already in the library** (`"skip_existing"`, off by default): a file whose name is already
   at its spot in the library isn't copied (in the normal modes it stays on the USB). Works in every mode.
 
@@ -56,8 +65,9 @@ While it runs, the importer keeps `/var/lib/media-import/status.json` up to date
 (mounting, scanning), `running` (file N of M, current file, bytes copied) and `finished` (with a
 `result` of `ok`, `problems`, `no_folder`, `nothing`, `aborted`, `mount_failed`, `interrupted` or
 `error`, plus counts, including `existing` for files skip-existing mode didn't copy, the `mode` (`compressed`,
-`ripped` or `library`), the movies and shows found (`items`, one per movie or show, with file counts,
-sizes and how far each got) and a message). In library drive mode the state goes `plugged_in` ->
+`ripped` or `library`), the movies and shows found (`items`, one per movie or show, with
+`dir` `in` (drive -> library) or `out` (library -> drive), file counts, sizes and how far each got;
+plus `exported`, `no_space` and `drive_free` when the library is copied onto the drive) and a message). In library drive mode the state goes `plugged_in` ->
 `review` (waiting for approval) -> `running` -> `finished`; a cancel or rejecting everything finishes
 with `cancelled`. It's rewritten every 5 seconds during a run, so a stale
 `updated` time means the importer died. The Xenticorp dashboard reads it to show the import status.
