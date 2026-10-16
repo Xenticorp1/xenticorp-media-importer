@@ -4,7 +4,8 @@ Headless USB to Jellyfin importer for a Linux media server. Plug in a USB with a
 
 | On the USB | Goes to |
 |---|---|
-| `Compressed Media/Movie.mkv` (or `.mp4`) | `/srv/jellyfin/media/movies/` |
+| `Compressed Media/Movie.mkv` (or `.mp4`) | `/srv/jellyfin/media/movies/Movie/Movie.mkv` |
+| `Compressed Media/Movie.en.srt`, `Movie-poster.jpg`... | `/srv/jellyfin/media/movies/Movie/` (with its movie) |
 | `Compressed Media/<Show>/Season N/...` | `/srv/jellyfin/media/shows/<Show>/Season N/...` |
 
 The library paths above are examples. Set yours with `LIBRARY_ROOT` in `media_import.py` and `LIB` in `install.sh`.
@@ -43,6 +44,27 @@ when a drive is plugged in; a missing or broken file means all defaults.
     runs read-only and the run says the library wasn't copied.
 - **Skip files already in the library** (`"skip_existing"`, off by default): a file whose name is already
   at its spot in the library isn't copied (in the normal modes it stays on the USB). Works in every mode.
+  A movie still sitting loose in `movies/` counts too, so nothing is duplicated before you tidy.
+- **Movie folders** (`"movie_folders"`, **on** by default): each movie goes into a folder of its own, the
+  way Jellyfin likes it, along with the loose files whose names start with the movie's name (subtitles,
+  `-poster.jpg`, `.nfo`): `Heat (1995).mkv` + `Heat (1995).en.srt` -> `movies/Heat (1995)/`. Loose files
+  that don't belong to a movie are left on the USB. It applies to library drives too, both ways: a
+  drive with loose movies is sorted into folders in the library, and the library goes onto a drive in
+  folders. Off, movies land loose in `movies/` and other loose files are skipped, as before.
+
+## Tidy library
+
+The dashboard's **Tidy library** button sorts movies already sitting loose in `movies/` into a folder
+each, by the same rule. It first shows what would move; nothing moves until you confirm. Files are
+renamed in place (same drive, instant), never overwritten: if the folder already has a file with the same
+name, that one stays loose and is reported. Loose files that don't belong to a movie stay put. It waits
+for any running import (same lock).
+
+The dashboard asks for it by writing `/var/lib/media-import/tidy-request.json`; `media-import-tidy.path`
+(installed by `install.sh`) runs `media_import.py --tidy`, which writes the plan or result to
+`/var/lib/media-import/tidy.json`. By hand: `sudo python3 media_import.py --tidy` (plan only) or
+`--tidy --run`. Jellyfin notices the moves on its own if real-time monitoring is on; otherwise run a
+library scan.
 
 ## Install
 
@@ -56,7 +78,7 @@ sudo ./install.sh
 
 ```bash
 cd /path/to/media-import && git pull
-# re-run sudo ./install.sh only if media-import@.service or 99-media-import.rules changed
+# re-run sudo ./install.sh only if a .service, .path or .rules file changed
 ```
 
 ## Status file

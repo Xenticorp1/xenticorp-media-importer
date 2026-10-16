@@ -3,7 +3,7 @@
 # drive mounted:  sudo ./install.sh
 #
 # /opt/media-import is a symlink to this clone, so `git pull` updates the script
-# immediately. Re-run this installer only if the .service or .rules file changed.
+# immediately. Re-run this installer only if a .service, .path or .rules file changed.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 LIB=/mnt/media/jellyfin/media
@@ -18,6 +18,10 @@ fi
 ln -sfn "$REPO" /opt/media-import
 install -Dm644 "$REPO/media-import@.service" /etc/systemd/system/media-import@.service
 install -Dm644 "$REPO/99-media-import.rules" /etc/udev/rules.d/99-media-import.rules
+# Dashboard "Tidy library" button: a path unit watching for its request file
+install -Dm644 "$REPO/media-import-tidy.service" /etc/systemd/system/media-import-tidy.service
+install -Dm644 "$REPO/media-import-tidy.path" /etc/systemd/system/media-import-tidy.path
+mkdir -p /var/lib/media-import
 
 # Never let the importer touch the library drive itself
 mkdir -p /etc/media-import
@@ -29,6 +33,7 @@ if [[ -n $UUID ]] && ! grep -qix "$UUID" /etc/media-import/ignore-uuids; then
 fi
 
 systemctl daemon-reload
+systemctl enable --now media-import-tidy.path
 udevadm control --reload-rules
 echo "Installed (/opt/media-import -> $REPO)."
 echo "Logs:  journalctl -fu 'media-import@*'"

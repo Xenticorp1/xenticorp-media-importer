@@ -1,0 +1,11 @@
+# Xenticorp Media Import: the dashboard's "Tidy library" button drops tidy-request.json here, and this
+# starts media-import-tidy.service to plan or do it (it removes the file straight away).
+[Unit]
+Description=Xenticorp Media Import: tidy requests from the dashboard
+
+[Path]
+PathExists=/var/lib/media-import/tidy-request.json
+Unit=media-import-tidy.service
+
+[Install]
+WantedBy=multi-user.target

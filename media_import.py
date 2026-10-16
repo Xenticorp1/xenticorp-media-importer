@@ -21,6 +21,14 @@ Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.jso
   way, into the drive's Movies/ and Shows/ folders (anything not on it yet; the
   library itself is never changed). That needs the drive read-write.
 - Skip files already in the library (works in every mode; see below).
+- Movie folders (on unless switched off): each movie goes into a folder of its
+  own, the way Jellyfin likes it, with the loose files that share its name
+  (subtitles, artwork, .nfo): Heat (1995).mkv + Heat (1995).en.srt ->
+  <library>/movies/Heat (1995)/. Also used when copying onto a library drive.
+
+Tidy (the dashboard's "Tidy library" button, or by hand): moves movies sitting
+loose in <library>/movies into a folder each, the same way. --tidy only plans
+it; --tidy --run moves. Nothing is ever overwritten.
 
 - Loose .mkv / .mp4 files at the root count as movies; other loose files are ignored.
 - A show folder is matched to an existing library show by name. Case, punctuation
@@ -39,6 +47,7 @@ Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.jso
   list and the library drive never touch it.
 
 Manual use:  sudo python3 media_import.py --dir /path/to/mounted/usb
+             sudo python3 media_import.py --tidy [--run]
 """
 import fcntl
 import hashlib
@@ -62,6 +71,9 @@ SOURCE_FOLDERS = {"compressed": "Compressed Media", "ripped": "Ripped Media"}  #
 LIBRARY_FOLDERS = {"movies": "Movies", "shows": "Shows"}  # library drive mode; case doesn't matter
 DRIVE_SPARE = 512 * 1024 * 1024  # copying the library onto a drive leaves at least this much free
 MOVIE_EXTS = {".mkv", ".mp4"}
+# Any video, for working out which loose files belong to one movie (copy is still MOVIE_EXTS-only in
+# Compressed / Ripped Media; library drives and the library itself can hold anything).
+VIDEO_EXTS = MOVIE_EXTS | {".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".webm", ".mpg", ".mpeg"}
 IGNORE_UUIDS_FILE = Path("/etc/media-import/ignore-uuids")  # drives never touched
 MOUNT_BASE = Path("/run/media-import")
 LOCK_FILE = "/run/media-import.lock"
@@ -69,6 +81,8 @@ CHUNK = 8 * 1024 * 1024
 STATUS_FILE = Path("/var/lib/media-import/status.json")  # read by the dashboard
 SETTINGS_FILE = Path("/var/lib/media-import/settings.json")  # written by the dashboard
 REVIEW_FILE = Path("/var/lib/media-import/review.json")  # library drive mode: the dashboard's approval
+TIDY_REQUEST = Path("/var/lib/media-import/tidy-request.json")  # the dashboard's Tidy button
+TIDY_STATUS = Path("/var/lib/media-import/tidy.json")  # read by the dashboard
 SYS_BLOCK = Path("/sys/class/block")
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 # Episode codes like S01E01 / s1e1 / 1x01; loose files matching this aren't movies.
@@ -169,7 +183,8 @@ def run(cmd):
 def load_settings():
     """The dashboard's switches. Anything missing or unreadable gets the default:
     Compressed Media, library drive mode off, existing library files overwritten."""
-    settings = {"source": "compressed", "library_drive": False, "export_library": False, "skip_existing": False}
+    settings = {"source": "compressed", "library_drive": False, "export_library": False, "skip_existing": False,
+                "movie_folders": True}
     try:
         raw = json.loads(SETTINGS_FILE.read_text())
         if not isinstance(raw, dict):
@@ -185,6 +200,7 @@ def load_settings():
     # A sub-switch of library drive mode: means nothing without it.
     settings["export_library"] = settings["library_drive"] and raw.get("export_library") is True
     settings["skip_existing"] = raw.get("skip_existing") is True
+    settings["movie_folders"] = raw.get("movie_folders") is not False  # on unless switched off
     return settings
 
 
@@ -286,9 +302,20 @@ def movie_name(rel, stems):
     return next((st for st in stems if rel.name.startswith(st)), Path(rel.name).stem)
 
 
-def loose_video_stems(folder):
-    return sorted((e.stem for e in folder.iterdir() if e.is_file() and e.suffix.lower() in MOVIE_EXTS),
+def loose_video_stems(folder, exts=VIDEO_EXTS):
+    return sorted((e.stem for e in folder.iterdir() if e.is_file() and e.suffix.lower() in exts),
                   key=len, reverse=True)  # longest first, so "Heat 2" wins over "Heat"
+
+
+def movie_dest(movies, rel, name, folders):
+    """Where a file from a Movies folder goes under `movies`: a loose file moves into its movie's
+    own folder when folders is on (Heat.en.srt -> Heat/Heat.en.srt); anything else keeps its path."""
+    return movies / name / rel.name if folders and len(rel.parts) == 1 else movies / rel
+
+
+def already_there(d, movies):
+    """d exists, or it's movies/<Movie>/<file> and that file still sits loose in movies/ (not tidied)."""
+    return d.exists() or (d.parent.parent == movies and (movies / d.name).exists())
 
 
 def add_show(items, entry):
@@ -297,10 +324,12 @@ def add_show(items, entry):
     return show_dir, add_item(items, "show", entry.name, target=show_dir.name, new=not exists)
 
 
-def scan_media_folder(src_dir, items):
-    """Compressed / Ripped Media: loose videos are movies, folders are shows.
+def scan_media_folder(src_dir, items, folders=False):
+    """Compressed / Ripped Media: loose videos are movies, folders are shows. With movie folders on,
+    each movie gets its own folder and takes the loose files sharing its name (subtitles, artwork).
     Returns (jobs as (src, dst, item id), skipped misplaced episodes)."""
     jobs, skipped = [], 0
+    movies = [st for st in loose_video_stems(src_dir, MOVIE_EXTS) if not EPISODE_RE.search(st)]
     for entry in sorted(src_dir.iterdir(), key=lambda p: p.name.lower()):
         if is_junk(entry.name):
             continue
@@ -310,9 +339,13 @@ def scan_media_folder(src_dir, items):
                     log(f"Skipping '{entry.name}': looks like a TV episode, put it in a show folder")
                     skipped += 1
                     continue
-                jobs.append((entry, MOVIES_DIR / entry.name, add_item(items, "movie", entry.stem)))
+                dst = MOVIES_DIR / entry.stem / entry.name if folders else MOVIES_DIR / entry.name
+                jobs.append((entry, dst, add_item(items, "movie", entry.stem)))
+            elif folders and (name := next((st for st in movies if entry.name.startswith(st)), None)):
+                jobs.append((entry, MOVIES_DIR / name / entry.name, add_item(items, "movie", name)))
             else:
-                log(f"Skipping non-video file: {entry.name}")
+                log(f"Skipping non-video file: {entry.name}"
+                    + ("" if folders else " (turn on movie folders to bring a movie's subtitles and artwork along)"))
         elif entry.is_dir():
             show_dir, iid = add_show(items, entry)
             for s in walk_files(entry):
@@ -330,7 +363,7 @@ def library_folders(root):
     return found
 
 
-def scan_library_drive(found, items):
+def scan_library_drive(found, items, folders=False):
     """Library drive mode: every file, folders kept. Movies/X/... -> movies/X/...; a show folder
     is matched to an existing library show like in the other modes. Each folder in Movies/ is one
     movie; a loose file there belongs to the loose video its name starts with (Heat.en.srt -> Heat)."""
@@ -340,7 +373,8 @@ def scan_library_drive(found, items):
         stems = loose_video_stems(movies)
         for s in walk_files(movies):
             rel = s.relative_to(movies)
-            jobs.append((s, MOVIES_DIR / rel, add_item(items, "movie", movie_name(rel, stems))))
+            name = movie_name(rel, stems)
+            jobs.append((s, movie_dest(MOVIES_DIR, rel, name, folders), add_item(items, "movie", name)))
     if "shows" in found:
         for entry in sorted(found["shows"].iterdir(), key=lambda p: p.name.lower()):
             if is_junk(entry.name):
@@ -354,7 +388,7 @@ def scan_library_drive(found, items):
     return jobs
 
 
-def scan_library_export(root, found, items):
+def scan_library_export(root, found, items, folders=False):
     """Library drive mode's copy onto the drive: every library file that isn't on the drive yet, into
     its Movies/ and Shows/ folders (made if missing). A library show goes into the drive's folder for
     the same show when there is one ("Breaking Bad (2008)" -> the drive's "Breaking Bad")."""
@@ -363,9 +397,12 @@ def scan_library_export(root, found, items):
     stems = loose_video_stems(MOVIES_DIR)
     for s in walk_files(MOVIES_DIR):
         rel = s.relative_to(MOVIES_DIR)
-        if s.name.startswith(".") or (drive_movies / rel).exists():
+        name = movie_name(rel, stems)
+        d = movie_dest(drive_movies, rel, name, folders)
+        # Already on the drive, in its folder or still loose there (a drive that isn't tidied yet).
+        if s.name.startswith(".") or already_there(d, drive_movies) or (drive_movies / rel).exists():
             continue
-        jobs.append((s, drive_movies / rel, add_item(items, "movie", movie_name(rel, stems), "out")))
+        jobs.append((s, d, add_item(items, "movie", name, "out")))
     drive_shows = found.get("shows") or root / LIBRARY_FOLDERS["shows"]
     on_drive = {norm_title(e.name): e for e in drive_shows.iterdir() if e.is_dir()} if drive_shows.is_dir() else {}
     for show in sorted(SHOWS_DIR.iterdir(), key=lambda p: p.name.lower()):
@@ -464,11 +501,12 @@ def import_media(root: Path, settings=None):
 
     items = {}  # the movies and shows found, for the dashboard
     if library:
-        jobs, skipped = scan_library_drive(found, items), 0  # (src, dst, item id); skipped = misplaced episodes
+        folders = settings["movie_folders"]
+        jobs, skipped = scan_library_drive(found, items, folders), 0  # (src, dst, item id); skipped = misplaced episodes
         if export:  # copied after the imports; never reviewed, everything new goes onto the drive
-            jobs += scan_library_export(root, found, items)
+            jobs += scan_library_export(root, found, items, folders)
     else:
-        jobs, skipped = scan_media_folder(src_dir, items)
+        jobs, skipped = scan_media_folder(src_dir, items, settings["movie_folders"])
 
     existing = 0  # already in the library, left on the USB (skip-existing mode)
     if jobs and settings["skip_existing"]:
@@ -477,7 +515,7 @@ def import_media(root: Path, settings=None):
     for s, d, iid in jobs:
         item = items[iid]
         item["files"] += 1
-        if item["dir"] == "in" and settings["skip_existing"] and d.exists():
+        if item["dir"] == "in" and settings["skip_existing"] and already_there(d, MOVIES_DIR):
             log(f"Skipping '{s.relative_to(base)}': already in the library")
             existing += 1
             item["existing"] += 1
@@ -573,6 +611,10 @@ def import_media(root: Path, settings=None):
             log(f"[{i}/{len(jobs)}] {action}: {rel} -> {d}")
             copy_verify_delete(s, d, delete=not library)
             item["done"] += 1
+            flat = MOVIES_DIR / d.name
+            if not out and d.parent.parent == MOVIES_DIR and flat.is_file():
+                flat.unlink()  # the same file still loose in movies/ was overwritten by this one
+                log(f"  replaced the loose copy {flat}")
             if out:
                 exported += 1
                 STATUS.update(exported=exported)
@@ -714,6 +756,104 @@ def handle_device(dev):
                 pass
 
 
+# ---- Tidy: loose movies in the library -> a folder each ----------------------------------------
+
+def tidy_write(data):
+    data["updated"] = int(time.time())
+    try:
+        TIDY_STATUS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TIDY_STATUS.with_name(TIDY_STATUS.name + ".tmp")
+        tmp.write_text(json.dumps(data) + "\n")
+        tmp.chmod(0o644)
+        os.replace(tmp, TIDY_STATUS)
+    except OSError as e:
+        print(f"(couldn't write {TIDY_STATUS}: {e})", flush=True)
+
+
+def tidy_plan():
+    """Loose files in movies/, grouped by the movie folder they'd move into. A file only belongs to a
+    movie if its name starts with that movie's video name; anything else (a stray poster.jpg) stays.
+    Returns ([{"name", "files", "conflicts"}], [names left where they are])."""
+    stems = loose_video_stems(MOVIES_DIR)
+    plan, left = {}, []
+    for e in sorted(MOVIES_DIR.iterdir(), key=lambda p: p.name.lower()):
+        if not e.is_file() or e.name.startswith(".") or is_junk(e.name):
+            continue
+        name = next((st for st in stems if e.name.startswith(st)), None)
+        if name is None:
+            left.append(e.name)
+            continue
+        movie = plan.setdefault(name, {"name": name, "files": [], "conflicts": []})
+        # Never overwrite: a file already in the movie's folder under the same name stays loose.
+        movie["conflicts" if (MOVIES_DIR / name / e.name).exists() else "files"].append(e.name)
+    return [m for m in plan.values() if m["files"] or m["conflicts"]], left
+
+
+def tidy(action, request_id=None):
+    """action "plan": write what would move to TIDY_STATUS. "run": move it. Library moves are renames on
+    the same drive, so they're instant and nothing is copied."""
+    data = {"v": 1, "id": request_id, "action": action, "state": "planning" if action == "plan" else "running",
+            "started": int(time.time()), "finished": None, "movies": [], "left": [], "moved": 0,
+            "movies_moved": 0, "conflicts": 0, "message": None}
+    tidy_write(data)
+    if not MOVIES_DIR.is_dir() or fs_of(LIBRARY_ROOT, "TARGET") == "/":
+        data.update(state="failed", finished=int(time.time()),
+                    message="The library drive isn't mounted, so nothing was moved")
+        tidy_write(data)
+        return 2
+    movies, left = tidy_plan()
+    data.update(movies=movies, left=left, conflicts=sum(len(m["conflicts"]) for m in movies))
+    if action == "plan":
+        n = sum(1 for m in movies if m["files"])
+        log(f"Tidy plan: {n} movie{'s' if n != 1 else ''} to move into folders, {len(left)} loose file(s) stay")
+        data.update(state="ready", finished=int(time.time()))
+        tidy_write(data)
+        return 0
+    failed = []
+    for m in movies:
+        folder = MOVIES_DIR / m["name"]
+        moved_any = False
+        for name in m["files"]:
+            src, dst = MOVIES_DIR / name, folder / name
+            try:
+                folder.mkdir(exist_ok=True)
+                if dst.exists():  # appeared since the plan: leave it
+                    m["conflicts"].append(name)
+                    continue
+                os.rename(src, dst)
+                log(f"Tidy: {name} -> {folder.name}/")
+                data["moved"] += 1
+                moved_any = True
+            except OSError as e:
+                log(f"Tidy: couldn't move {name}: {e}")
+                failed.append(name)
+        data["movies_moved"] += moved_any
+        tidy_write(data)
+    data["conflicts"] = sum(len(m["conflicts"]) for m in movies)
+    os.sync()
+    msg = [f"Moved {data['movies_moved']} movie{'s' if data['movies_moved'] != 1 else ''} into their own folders"]
+    if data["conflicts"]:
+        msg.append(f"{data['conflicts']} file(s) stayed loose because the folder already has a file with that name")
+    if failed:
+        msg.append(f"{len(failed)} file(s) couldn't be moved: " + ", ".join(failed[:5]))
+    data.update(state="failed" if failed else "done", finished=int(time.time()), message="; ".join(msg))
+    tidy_write(data)
+    log("Tidy: " + data["message"])
+    return 1 if failed else 0
+
+
+def tidy_request():
+    """The dashboard's request (TIDY_REQUEST), removed as soon as it's read so systemd's path unit
+    doesn't start this again. Returns (action, id)."""
+    try:
+        req = json.loads(TIDY_REQUEST.read_text())
+    except (OSError, ValueError):
+        req = {}
+    TIDY_REQUEST.unlink(missing_ok=True)
+    req = req if isinstance(req, dict) else {}
+    return ("run" if req.get("action") == "run" else "plan"), req.get("id") if isinstance(req.get("id"), str) else None
+
+
 def stopped(signum, frame):
     # systemd stops the service (SIGTERM) when the drive is pulled mid-run (BindsTo=) or X4 shuts
     # down. Unwind normally so the half-written copy is removed and the status says what happened.
@@ -726,6 +866,15 @@ def main():
         def target():
             STATUS.start(None, sys.argv[2])
             return import_media(Path(sys.argv[2]))
+    elif sys.argv[1:2] == ["--tidy"] and len(sys.argv) <= 3:
+        if sys.argv[2:] == ["--run"]:
+            action, request_id = "run", None
+        elif len(sys.argv) == 2:
+            action, request_id = tidy_request()
+        else:
+            print(__doc__)
+            return 64
+        target = lambda: tidy(action, request_id)
     elif len(sys.argv) == 2:
         target = lambda: handle_device(sys.argv[1])
     else:
