@@ -61,13 +61,16 @@ when a drive is plugged in; a missing or broken file means all defaults.
 
 The dashboard's **Sort incoming** button (or `sudo python3 media_import.py --incoming`) moves everything
 inside `INCOMING_DIR`'s `movies/` and `shows/` folders into the library (set `INCOMING_DIR` at the top
-of `media_import.py`). The `movies/` and `shows/` folders themselves always stay; folders inside them
-that the run empties are removed.
+of `media_import.py`), then clears those two folders completely: the `movies/` and `shows/` folders
+themselves stay, everything inside them goes. That happens even when there was no media to move (empty
+folders, `Thumbs.db`, a stray `folder.jpg`).
 
 - Sorted the same way as a library drive: movie folders (if that switch is on) and show matching.
 - Each file is copied, SHA-256 verified, and only then removed from incoming (it's usually another drive).
 - A movie or show that's already in the library only gets its new files: anything already there under
-  the same name isn't copied and stays in incoming, whatever the skip-existing switch says.
+  the same name isn't copied, and is deleted from incoming (whatever the skip-existing switch says).
+- The only things left behind are media that isn't safely in the library, listed on the card: a file
+  whose copy failed, one still being written (below), and episodes not inside a show folder.
 - A file changed in the last 2 minutes is left for next time, in case it's still being written.
 - Two `movies` or two `shows` folders that differ only in capitals (`Shows` and `shows`) stop the run with
   a message, since only one would be read; the same goes for a library drive. A season folder sitting

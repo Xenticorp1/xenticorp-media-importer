@@ -407,6 +407,8 @@ def scan_library_drive(found, items, folders=False, orphans=None):
                 continue
             if not entry.is_dir():
                 log(f"Skipping '{found['shows'].name}/{entry.name}': not inside a show folder")
+                if orphans is not None and entry.suffix.lower() in VIDEO_EXTS:  # a stray folder.jpg is fine
+                    orphans.append(f"{found['shows'].name}/{entry.name}")
                 continue
             if SEASON_DIR_RE.match(entry.name):  # would otherwise become a show called "Season 3"
                 log(f"Skipping '{found['shows'].name}/{entry.name}': a season folder needs to be inside its show's folder")
@@ -447,6 +449,44 @@ def scan_library_export(root, found, items, folders=False):
             jobs.append((s, d, add_item(items, "show", show.name, "out", target=target.name,
                                         new=not target.exists())))
     return jobs
+
+
+def clear_incoming(found, dupes):
+    """After Sort incoming: delete the files that were already in the library (dupes), junk files, and
+    loose non-video files in shows/, and every folder left empty under incoming's movies/ and shows/
+    (those two stay). Runs even when nothing was copied. Anything else still there is media that isn't
+    in the library (failed, still being written, not inside a show folder) and is kept."""
+    STATUS.update(step="cleaning up", file=None, force=True)
+    for f in dupes:
+        try:
+            f.unlink()
+            log(f"Removed from incoming (already in the library): {f}")
+        except OSError as e:
+            log(f"  Could not remove {f}: {e}")
+    shows = found.get("shows")
+    if shows:  # loose non-video files in shows/ (a stray folder.jpg) belong to no show: they go too
+        for e in shows.iterdir():
+            if e.is_file() and e.suffix.lower() not in VIDEO_EXTS:
+                try:
+                    e.unlink()
+                    log(f"Removed from incoming (not part of any show): {e.name}")
+                except OSError:
+                    pass
+    for top in found.values():
+        for dirpath, dirnames, filenames in os.walk(top, topdown=False):
+            d = Path(dirpath)
+            for fn in filenames:
+                if is_junk(fn):
+                    try:
+                        (d / fn).unlink()
+                    except OSError:
+                        pass
+            if d != top:
+                try:
+                    d.rmdir()  # only succeeds when it's empty
+                    log(f"Removed empty folder from incoming: {d.relative_to(top.parent)}")
+                except OSError:
+                    pass
 
 
 def wait_for_review(items):
@@ -566,6 +606,7 @@ def import_media(root: Path, settings=None, incoming=False):
         jobs, skipped = scan_media_folder(src_dir, items, settings["movie_folders"])
 
     existing = 0  # already in the library, left on the USB (skip-existing mode)
+    dupes = []  # Sort incoming: those files, deleted from incoming at the end
     recent = 0  # Sort incoming: changed too recently, maybe still being written
     if jobs and skip_existing:
         log("Skip-existing mode is on: files already in the library aren't copied.")
@@ -586,6 +627,8 @@ def import_media(root: Path, settings=None, incoming=False):
         if item["dir"] == "in" and skip_existing and already_there(d, MOVIES_DIR):
             log(f"Skipping '{s.relative_to(base)}': already in the library")
             existing += 1
+            if incoming:
+                dupes.append(s)
             item["existing"] += 1
             continue
         try:
@@ -628,16 +671,18 @@ def import_media(root: Path, settings=None, incoming=False):
             return 0
     left_note = "; ".join(n for n in (
         existing and f"{existing} file{'s' if existing != 1 else ''} already in the library"
-                     + (f", left {place}" if delete else ", not copied"),
+                     + (", removed from incoming" if incoming else f", left {place}" if delete else ", not copied"),
         recent and f"{recent} file{'s' if recent != 1 else ''} changed in the last {INCOMING_SETTLE // 60} minutes"
                    " and stayed in incoming for next time") if n) or None
 
-    orphan_note = (f"{len(orphans)} season folder{'s' if len(orphans) != 1 else ''} not inside a show's folder "
+    orphan_note = (f"{len(orphans)} item{'s' if len(orphans) != 1 else ''} in Shows not inside a show's folder "
                    f"stayed where {'they were' if len(orphans) != 1 else 'it was'} ({', '.join(orphans[:5])}): "
-                   "put each inside a folder named after its show" if orphans else None)
+                   "put episodes inside a folder named after their show" if orphans else None)
 
     if not jobs:
         log("Nothing to import.")
+        if incoming:
+            clear_incoming(found, dupes)
         if orphans:
             STATUS.finish("problems", "; ".join(n for n in (orphan_note, left_note) if n))
             return 1
@@ -711,7 +756,9 @@ def import_media(root: Path, settings=None, incoming=False):
             item["state"] = "failed" if item["failed"] else "done"
             STATUS.update(force=True)
 
-    if delete:  # only folders this run emptied; nothing to tidy up when nothing was deleted
+    if incoming:
+        clear_incoming(found, dupes)
+    elif delete:  # only folders this run emptied; nothing to tidy up when nothing was deleted
         clean_up_emptied(base, jobs, found.values() if library else None)
 
     os.sync()
