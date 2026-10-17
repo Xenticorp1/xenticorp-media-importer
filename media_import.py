@@ -98,6 +98,8 @@ TIDY_STATUS = Path("/var/lib/media-import/tidy.json")  # read by the dashboard
 SYS_BLOCK = Path("/sys/class/block")
 JUNK_NAMES = {".ds_store", "thumbs.db", "desktop.ini"}
 # Episode codes like S01E01 / s1e1 / 1x01; loose files matching this aren't movies.
+# A season folder ("Season 3", "Specials", "S03") sitting where a show folder should be.
+SEASON_DIR_RE = re.compile(r"(?i)^(season\s*\d+|specials|s\d{1,2})$")
 EPISODE_RE = re.compile(r"(?i)(?<![a-z0-9])(s\d{1,2}\s*e\d{1,3}|\d{1,2}x\d{2,3})(?![0-9])")
 # -----------------------------------------------------------------------------
 
@@ -376,7 +378,18 @@ def library_folders(root):
     return found
 
 
-def scan_library_drive(found, items, folders=False):
+def library_folder_clashes(root):
+    """Names of Movies/Shows folders that exist more than once in different capitals ("Shows" and
+    "shows"): only one would be read, so the run stops instead of quietly skipping the other."""
+    clashes = []
+    for name in LIBRARY_FOLDERS.values():
+        same = sorted(e.name for e in root.iterdir() if e.is_dir() and e.name.lower() == name.lower())
+        if len(same) > 1:
+            clashes.append(same)
+    return clashes
+
+
+def scan_library_drive(found, items, folders=False, orphans=None):
     """Library drive mode: every file, folders kept. Movies/X/... -> movies/X/...; a show folder
     is matched to an existing library show like in the other modes. Each folder in Movies/ is one
     movie; a loose file there belongs to the loose video its name starts with (Heat.en.srt -> Heat)."""
@@ -394,6 +407,11 @@ def scan_library_drive(found, items, folders=False):
                 continue
             if not entry.is_dir():
                 log(f"Skipping '{found['shows'].name}/{entry.name}': not inside a show folder")
+                continue
+            if SEASON_DIR_RE.match(entry.name):  # would otherwise become a show called "Season 3"
+                log(f"Skipping '{found['shows'].name}/{entry.name}': a season folder needs to be inside its show's folder")
+                if orphans is not None:
+                    orphans.append(f"{found['shows'].name}/{entry.name}")
                 continue
             show_dir, iid = add_show(items, entry)
             for s in walk_files(entry):
@@ -494,6 +512,13 @@ def import_media(root: Path, settings=None, incoming=False):
     place = "in incoming" if incoming else "on the drive"  # where a file that isn't moved stays
     mode = "incoming" if incoming else "library" if library else settings["source"]
     STATUS.update(step="scanning", mode=mode, deletes=delete, force=True)
+    clashes = library_folder_clashes(root) if library else []
+    if clashes:
+        names = "; ".join(" and ".join(f"'{n}'" for n in c) for c in clashes)
+        log(f"Stopping: {names} are the same folder in different capitals; only one would be read.")
+        STATUS.finish("problems", f"Found {names}: move everything into one of them and delete the other. "
+                                  "Nothing was copied.")
+        return 1
     if incoming:
         found = library_folders(root)
         if not found:
@@ -531,9 +556,10 @@ def import_media(root: Path, settings=None, incoming=False):
         return 2
 
     items = {}  # the movies and shows found, for the dashboard
+    orphans = []  # season folders sitting directly in Shows/ (library drive / incoming)
     if library:
         folders = settings["movie_folders"]
-        jobs, skipped = scan_library_drive(found, items, folders), 0  # (src, dst, item id); skipped = misplaced episodes
+        jobs, skipped = scan_library_drive(found, items, folders, orphans), 0  # (src, dst, item id); skipped = misplaced episodes
         if export:  # copied after the imports; never reviewed, everything new goes onto the drive
             jobs += scan_library_export(root, found, items, folders)
     else:
@@ -606,8 +632,15 @@ def import_media(root: Path, settings=None, incoming=False):
         recent and f"{recent} file{'s' if recent != 1 else ''} changed in the last {INCOMING_SETTLE // 60} minutes"
                    " and stayed in incoming for next time") if n) or None
 
+    orphan_note = (f"{len(orphans)} season folder{'s' if len(orphans) != 1 else ''} not inside a show's folder "
+                   f"stayed where {'they were' if len(orphans) != 1 else 'it was'} ({', '.join(orphans[:5])}): "
+                   "put each inside a folder named after its show" if orphans else None)
+
     if not jobs:
         log("Nothing to import.")
+        if orphans:
+            STATUS.finish("problems", "; ".join(n for n in (orphan_note, left_note) if n))
+            return 1
         if skipped or existing:
             log(f"Done: 0 imported, 0 failed, {skipped} skipped (misplaced episodes)"
                 + (f", {existing} already in the library." if existing else "."))
@@ -685,8 +718,8 @@ def import_media(root: Path, settings=None, incoming=False):
     log(f"Done: {ok} imported, {len(failed)} failed, {skipped} skipped (misplaced episodes)"
         + (f", {existing} already in the library" if existing else "")
         + (f", {exported} copied onto the drive, {len(no_space)} didn't fit" if export else "") + ".")
-    if failed or skipped or no_space:
-        why = []
+    if failed or skipped or no_space or orphans:
+        why = [orphan_note] if orphans else []
         if failed:
             why.append(f"{len(failed)} file{'s' if len(failed) != 1 else ''} failed"
                        + (f" and stayed {place}" if delete else ""))

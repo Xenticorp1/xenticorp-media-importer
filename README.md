@@ -69,6 +69,10 @@ that the run empties are removed.
 - A movie or show that's already in the library only gets its new files: anything already there under
   the same name isn't copied and stays in incoming, whatever the skip-existing switch says.
 - A file changed in the last 2 minutes is left for next time, in case it's still being written.
+- Two `movies` or two `shows` folders that differ only in capitals (`Shows` and `shows`) stop the run with
+  a message, since only one would be read; the same goes for a library drive. A season folder sitting
+  straight in `shows/` (`shows/Season 3/...`) is left where it is and reported: it needs to go inside a
+  folder named after its show (`shows/Metalocalypse/Season 3/...`).
 - Progress and the list of what moved show on the dashboard's Importer card, like an import. It runs
   through the same path unit as Tidy, so there's nothing extra to install.
 
