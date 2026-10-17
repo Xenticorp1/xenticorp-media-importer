@@ -26,6 +26,13 @@ Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.jso
   (subtitles, artwork, .nfo): Heat (1995).mkv + Heat (1995).en.srt ->
   <library>/movies/Heat (1995)/. Also used when copying onto a library drive.
 
+Sort incoming (the dashboard's "Sort incoming" button, or --incoming by hand):
+everything inside INCOMING_DIR's movies/ and shows/ folders goes into the library
+the same way as a library drive (movie folders, show matching), then is removed
+from incoming; the movies/ and shows/ folders themselves stay. Files already in
+the library are never copied again (they stay in incoming), and a file changed in
+the last couple of minutes is left for next time in case it's still being written.
+
 Tidy (the dashboard's "Tidy library" button, or by hand): moves movies sitting
 loose in <library>/movies into a folder each, the same way. --tidy only plans
 it; --tidy --run moves. Nothing is ever overwritten.
@@ -50,6 +57,7 @@ it; --tidy --run moves. Nothing is ever overwritten.
 
 Manual use:  sudo python3 media_import.py --dir /path/to/mounted/usb
              sudo python3 media_import.py --tidy [--run]
+             sudo python3 media_import.py --incoming
 """
 import fcntl
 import hashlib
@@ -69,6 +77,8 @@ from pathlib import Path
 LIBRARY_ROOT = Path("/mnt/media/jellyfin/media")
 MOVIES_DIR = LIBRARY_ROOT / "movies"
 SHOWS_DIR = LIBRARY_ROOT / "shows"
+INCOMING_DIR = Path("/home/greygamer14/incoming")  # Sort incoming: holds movies/ and shows/
+INCOMING_SETTLE = 120  # seconds a file must have been left alone before Sort incoming takes it
 SOURCE_FOLDERS = {"compressed": "Compressed Media", "ripped": "Ripped Media"}  # picked on the dashboard
 LIBRARY_FOLDERS = {"movies": "Movies", "shows": "Shows"}  # library drive mode; case doesn't matter
 DRIVE_SPARE = 512 * 1024 * 1024  # copying the library onto a drive leaves at least this much free
@@ -447,14 +457,16 @@ def wait_for_review(items):
         return rejected
 
 
-def clean_up_emptied(src_dir, jobs):
+def clean_up_emptied(src_dir, jobs, stops=None):
     STATUS.update(step="cleaning up", file=None, force=True)
     # Remove USB folders that this run emptied (deepest first). Folders that were
-    # already empty (e.g. a blank "Season 2") are never in this set, so they stay.
+    # already empty (e.g. a blank "Season 2") are never in this set, so they stay,
+    # and so do src_dir and the stops (incoming's movies/ and shows/).
+    stops = {src_dir, *(stops or ())}
     emptied = set()
     for s, *_ in jobs:
         p = s.parent
-        while p != src_dir:
+        while p not in stops and p != p.parent:
             emptied.add(p)
             p = p.parent
     for d in sorted(emptied, key=lambda p: len(p.parts), reverse=True):
@@ -469,14 +481,29 @@ def clean_up_emptied(src_dir, jobs):
             log(f"  Could not remove {d}: {e}")
 
 
-def import_media(root: Path, settings=None):
+def import_media(root: Path, settings=None, incoming=False):
+    """incoming: Sort incoming (root = INCOMING_DIR): laid out like a library drive, but everything is
+    moved (copied, verified, removed), files already in the library are always skipped, and there's no
+    review and no copy back."""
     settings = settings or load_settings()
-    library = settings["library_drive"]
+    library = settings["library_drive"] or incoming
     folder = SOURCE_FOLDERS[settings["source"]]
-    export = library and settings["export_library"]
-    delete = not library and settings["delete_after"]  # delete each file from the drive once it's verified
-    STATUS.update(step="scanning", mode="library" if library else settings["source"], deletes=delete, force=True)
-    if library:
+    export = library and settings["export_library"] and not incoming
+    delete = incoming or (not library and settings["delete_after"])  # delete each file once it's verified
+    skip_existing = incoming or settings["skip_existing"]
+    place = "in incoming" if incoming else "on the drive"  # where a file that isn't moved stays
+    mode = "incoming" if incoming else "library" if library else settings["source"]
+    STATUS.update(step="scanning", mode=mode, deletes=delete, force=True)
+    if incoming:
+        found = library_folders(root)
+        if not found:
+            log(f"No movies or shows folder in {root}, nothing to do.")
+            STATUS.finish("no_folder", f"No movies or shows folder in {root}")
+            return 0
+        base = root
+        where = " and ".join(f"'{p.name}'" for p in found.values())
+        log(f"Sort incoming: moving what's in {where} into the library.")
+    elif library:
         found = library_folders(root)
         if not found and not export:
             log(f"Library drive mode: no Movies or Shows folder on {root}, nothing to do.")
@@ -513,13 +540,24 @@ def import_media(root: Path, settings=None):
         jobs, skipped = scan_media_folder(src_dir, items, settings["movie_folders"])
 
     existing = 0  # already in the library, left on the USB (skip-existing mode)
-    if jobs and settings["skip_existing"]:
+    recent = 0  # Sort incoming: changed too recently, maybe still being written
+    if jobs and skip_existing:
         log("Skip-existing mode is on: files already in the library aren't copied.")
     keep = []
     for s, d, iid in jobs:
         item = items[iid]
+        if incoming:
+            try:
+                fresh = time.time() - s.stat().st_mtime < INCOMING_SETTLE
+            except OSError:
+                fresh = True
+            if fresh:
+                log(f"Leaving '{s.relative_to(base)}' for next time: it changed in the last {INCOMING_SETTLE // 60} minutes")
+                recent += 1
+                item["recent"] = item.get("recent", 0) + 1
+                continue
         item["files"] += 1
-        if item["dir"] == "in" and settings["skip_existing"] and already_there(d, MOVIES_DIR):
+        if item["dir"] == "in" and skip_existing and already_there(d, MOVIES_DIR):
             log(f"Skipping '{s.relative_to(base)}': already in the library")
             existing += 1
             item["existing"] += 1
@@ -535,7 +573,7 @@ def import_media(root: Path, settings=None):
                                                       kv[1]["name"].lower())))
     for item in items.values():
         if not item["copy"]:
-            item["state"] = "in_library"
+            item["state"] = "in_library" if item["existing"] or not item.get("recent") else "recent"
     drive_free = None
     if export:
         try:
@@ -546,7 +584,7 @@ def import_media(root: Path, settings=None):
 
     rejected = set()
     # Only what comes onto X4 is reviewed; the copy onto the drive always goes ahead.
-    if library and any(items[iid]["dir"] == "in" for _, _, iid in jobs):
+    if library and not incoming and any(items[iid]["dir"] == "in" for _, _, iid in jobs):
         rejected = wait_for_review(items)
         if rejected is None:
             for item in items.values():
@@ -562,8 +600,11 @@ def import_media(root: Path, settings=None):
             log("Everything was rejected; nothing to copy.")
             STATUS.finish("cancelled", "Everything was rejected on the dashboard; nothing was copied")
             return 0
-    left_note = (f"{existing} file{'s' if existing != 1 else ''} already in the library"
-                 + (", left on the drive" if delete else ", not copied") if existing else None)
+    left_note = "; ".join(n for n in (
+        existing and f"{existing} file{'s' if existing != 1 else ''} already in the library"
+                     + (f", left {place}" if delete else ", not copied"),
+        recent and f"{recent} file{'s' if recent != 1 else ''} changed in the last {INCOMING_SETTLE // 60} minutes"
+                   " and stayed in incoming for next time") if n) or None
 
     if not jobs:
         log("Nothing to import.")
@@ -577,8 +618,11 @@ def import_media(root: Path, settings=None):
                 why.append(left_note)
             STATUS.finish("problems", "; ".join(why))
             return 1
-        if existing:
+        if existing or recent:
             STATUS.finish("ok", left_note)
+            return 0
+        if incoming:
+            STATUS.finish("nothing", f"Nothing in incoming's {where} folder{'s' if len(found) > 1 else ''}")
             return 0
         STATUS.finish("nothing", ("Nothing new either way: the drive and the library have the same files"
                                   if export else f"Nothing in this drive's {where} folder{'s' if len(found) > 1 else ''}")
@@ -626,7 +670,7 @@ def import_media(root: Path, settings=None):
                 ok += 1
                 STATUS.update(imported=ok)
         except Exception as e:
-            log(f"  FAILED: {rel}: {e}" + (" (left on USB)" if delete else ""))
+            log(f"  FAILED: {rel}: {e}" + (f" (left {place})" if delete else ""))
             failed.append(rel)
             item["failed"] += 1
             STATUS.update(failed=len(failed), failed_files=[str(f) for f in failed[:10]], force=True)
@@ -635,7 +679,7 @@ def import_media(root: Path, settings=None):
             STATUS.update(force=True)
 
     if delete:  # only folders this run emptied; nothing to tidy up when nothing was deleted
-        clean_up_emptied(src_dir, jobs)
+        clean_up_emptied(base, jobs, found.values() if library else None)
 
     os.sync()
     log(f"Done: {ok} imported, {len(failed)} failed, {skipped} skipped (misplaced episodes)"
@@ -645,7 +689,7 @@ def import_media(root: Path, settings=None):
         why = []
         if failed:
             why.append(f"{len(failed)} file{'s' if len(failed) != 1 else ''} failed"
-                       + (" and stayed on the drive" if delete else ""))
+                       + (f" and stayed {place}" if delete else ""))
         if no_space:
             why.append(f"{len(no_space)} title{'s' if len(no_space) != 1 else ''} didn't fit on the drive: "
                        + ", ".join(no_space[:5]) + (", ..." if len(no_space) > 5 else ""))
@@ -856,7 +900,17 @@ def tidy_request():
         req = {}
     TIDY_REQUEST.unlink(missing_ok=True)
     req = req if isinstance(req, dict) else {}
-    return ("run" if req.get("action") == "run" else "plan"), req.get("id") if isinstance(req.get("id"), str) else None
+    action = req.get("action") if req.get("action") in ("run", "incoming") else "plan"
+    return action, req.get("id") if isinstance(req.get("id"), str) else None
+
+
+def sort_incoming():
+    STATUS.start(None, "Incoming folder")
+    if not INCOMING_DIR.is_dir():
+        log(f"{INCOMING_DIR} doesn't exist, nothing to do.")
+        STATUS.finish("no_folder", f"{INCOMING_DIR} doesn't exist")
+        return 0
+    return import_media(INCOMING_DIR, load_settings(), incoming=True)
 
 
 def stopped(signum, frame):
@@ -879,7 +933,10 @@ def main():
         else:
             print(__doc__)
             return 64
-        target = lambda: tidy(action, request_id)
+        # The same path unit also carries the dashboard's Sort incoming button.
+        target = sort_incoming if action == "incoming" else lambda: tidy(action, request_id)
+    elif sys.argv[1:] == ["--incoming"]:
+        target = sort_incoming
     elif len(sys.argv) == 2:
         target = lambda: handle_device(sys.argv[1])
     else:

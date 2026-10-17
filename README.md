@@ -57,6 +57,21 @@ when a drive is plugged in; a missing or broken file means all defaults.
   everything stays on the USB, which is then only ever mounted read-only (so a drive Windows left
   hibernated still imports). Library drive mode never deletes either way.
 
+## Sort incoming
+
+The dashboard's **Sort incoming** button (or `sudo python3 media_import.py --incoming`) moves everything
+inside `INCOMING_DIR`'s `movies/` and `shows/` folders into the library (set `INCOMING_DIR` at the top
+of `media_import.py`). The `movies/` and `shows/` folders themselves always stay; folders inside them
+that the run empties are removed.
+
+- Sorted the same way as a library drive: movie folders (if that switch is on) and show matching.
+- Each file is copied, SHA-256 verified, and only then removed from incoming (it's usually another drive).
+- A movie or show that's already in the library only gets its new files: anything already there under
+  the same name isn't copied and stays in incoming, whatever the skip-existing switch says.
+- A file changed in the last 2 minutes is left for next time, in case it's still being written.
+- Progress and the list of what moved show on the dashboard's Importer card, like an import. It runs
+  through the same path unit as Tidy, so there's nothing extra to install.
+
 ## Tidy library
 
 The dashboard's **Tidy library** button sorts movies already sitting loose in `movies/` into a folder
@@ -65,8 +80,9 @@ renamed in place (same drive, instant), never overwritten: if the folder already
 name, that one stays loose and is reported. Loose files that don't belong to a movie stay put. It waits
 for any running import (same lock).
 
-The dashboard asks for it by writing `/var/lib/media-import/tidy-request.json`; `media-import-tidy.path`
-(installed by `install.sh`) runs `media_import.py --tidy`, which writes the plan or result to
+The dashboard asks for it by writing `/var/lib/media-import/tidy-request.json` (`"action"`: `"plan"`,
+`"run"`, or `"incoming"` for Sort incoming); `media-import-tidy.path` (installed by `install.sh`) runs
+`media_import.py --tidy`, which writes the plan or result to
 `/var/lib/media-import/tidy.json`. By hand: `sudo python3 media_import.py --tidy` (plan only) or
 `--tidy --run`. Jellyfin notices the moves on its own if real-time monitoring is on; otherwise run a
 library scan.
