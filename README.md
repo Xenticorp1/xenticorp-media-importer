@@ -33,6 +33,13 @@ when a drive is plugged in; a missing or broken file means all defaults.
   you reject the ones you don't want and press approve (or cancel), and only the rest is copied. The
   answer comes back as `/var/lib/media-import/review.json` (`{"run_id": ..., "rejected": [ids]}` or
   `"cancel": true`). Unplugging the drive while it waits stops the run, as always.
+  Each title can also be **renamed** there (`"renames": {id: "New Name"}` in `review.json`): a movie's
+  folder and every file starting with its old name (`Heat/Heat.en.srt` -> `Heat (1995)/Heat (1995).en.srt`),
+  or a show's folder and the show-name part at the start of each episode file (`Dr Who - S01E01.mkv` ->
+  `Doctor Who (2005) - S01E01.mkv`; a new show name matching a library show goes into that show). It
+  applies to the library copy and to the drive itself, which is switched to read-write just for that; if
+  the drive can't be written, only the library copy gets the new name and the run says so. "Already in the
+  library" is checked under the new name, and nothing on the drive is ever overwritten.
   - **Copy the library onto the drive** (`"export_library"`, a sub-switch, off by default; ignored unless
     library drive mode is on): for swapping media with someone. After the imports, everything in X4's
     library that isn't on the drive yet is copied into the drive's `Movies/` and `Shows/` (made if

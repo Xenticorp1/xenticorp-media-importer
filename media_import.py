@@ -16,7 +16,9 @@ Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.jso
     Shows/<Show>/Season 01/...            -> <library>/shows/<Show>/Season 01/...
   Nothing on the drive is changed or deleted; it's only ever mounted read-only.
   The run then waits for the dashboard: you reject the movies/shows you don't
-  want and approve, and only the rest is copied.
+  want, rename any whose name is a little off, and approve; only the rest is
+  copied. A rename applies to the library copy and to the drive itself (the drive
+  is switched to read-write just for that).
   Sub-switch "copy the library onto the drive": X4's library also goes the other
   way, into the drive's Movies/ and Shows/ folders (anything not on it yet; the
   library itself is never changed). That needs the drive read-write.
@@ -188,6 +190,10 @@ class Status:
 
 
 STATUS = Status()
+
+# Library drive mode renames on the drive itself. handle_device() replaces this with a function that
+# switches the drive to read-write the first time it's needed (True if the drive can be written).
+drive_writable = lambda: True
 
 
 def run(cmd):
@@ -489,9 +495,94 @@ def clear_incoming(found, dupes):
                     pass
 
 
+def clean_name(name):
+    """A new movie / show name from the dashboard, or None if it isn't usable as a folder name."""
+    if not isinstance(name, str):
+        return None
+    name = name.strip().rstrip(".").strip()  # Windows drops trailing dots and spaces anyway
+    if not name or len(name) > 200 or name.startswith(".") or any(c in name for c in '/\\\0'):
+        return None
+    return name
+
+
+def swap_prefix(filename, old, new):
+    """Heat.en.srt -> Heat (1995).en.srt; files that don't start with the old name keep theirs."""
+    return new + filename[len(old):] if filename.startswith(old) else filename
+
+
+def renamed(path, top, old, new, folder=None):
+    """path under top, with its first folder renamed old -> new (or to `folder`, for a show matched to an
+    existing library show) and its file name's old prefix swapped for new."""
+    parts = list(path.relative_to(top).parts)
+    if len(parts) > 1 and (folder or parts[0] == old):
+        parts[0] = folder or new
+    parts[-1] = swap_prefix(parts[-1], old, new)
+    return top.joinpath(*parts)
+
+
+def apply_renames(renames, items, pairs, found, skip_existing):
+    """Library drive mode: rename approved titles. pairs: item id -> every (src, dst) of that title (also
+    ones skipped as already in the library). The drive is renamed too when it can be written; the
+    destinations always are, and "already in the library" is checked again under the new name.
+    Returns (item id -> new (src, dst) jobs, number of files now already in the library)."""
+    new_jobs, existing, drive_failed = {}, 0, []
+    for iid, new in renames.items():
+        item, old = items[iid], items[iid]["name"]
+        movie = item["kind"] == "movie"
+        target = None
+        if not movie:
+            show_dir, exists = find_show_dir(new)
+            target, item["target"], item["new"] = show_dir.name, show_dir.name, not exists
+        log(f"Renaming '{old}' -> '{new}'" + (f" (library: {target})" if target and target != new else ""))
+        top_src = found["movies" if movie else "shows"]
+        moved = {}
+        if drive_writable():
+            for src, _ in pairs[iid]:
+                dst = renamed(src, top_src, old, new)
+                if dst == src:
+                    continue
+                if dst.exists():
+                    log(f"  On the drive, {dst.name} already exists; left {src.name} as it is")
+                    drive_failed.append(src.name)
+                    continue
+                try:
+                    os.renames(src, dst)  # makes the new folder, prunes the emptied old one
+                    moved[src] = dst
+                except OSError as e:
+                    log(f"  Couldn't rename {src} on the drive: {e}")
+                    drive_failed.append(src.name)
+        else:
+            drive_failed.append(old)
+        jobs = []
+        item.update(files=0, existing=0, copy=0, bytes=0, renamed=new)
+        for src, dst in pairs[iid]:
+            src = moved.get(src, src)
+            dst = renamed(dst, MOVIES_DIR if movie else SHOWS_DIR, old, new, None if movie else target)
+            item["files"] += 1
+            if skip_existing and already_there(dst, MOVIES_DIR):
+                log(f"  Skipping '{dst.name}': already in the library under the new name")
+                item["existing"] += 1
+                existing += 1
+                continue
+            try:
+                item["bytes"] += src.stat().st_size
+            except OSError:
+                pass
+            item["copy"] += 1
+            jobs.append((src, dst, iid))
+        item["state"] = "waiting" if item["copy"] else "in_library"
+        new_jobs[iid] = jobs
+    if drive_failed:
+        note = ("Renamed in the library only: this drive couldn't be written (Windows may have left it hibernated)"
+                if not drive_writable() else
+                f"Couldn't rename {len(drive_failed)} file(s) on the drive: " + ", ".join(drive_failed[:5]))
+        STATUS.update(note="; ".join(n for n in (STATUS.data.get("note") if STATUS.data else None, note) if n))
+    return new_jobs, existing
+
+
 def wait_for_review(items):
     """Library drive mode: show the list on the dashboard and wait until it's approved there.
-    Returns the rejected item ids, or None if the run was cancelled."""
+    Returns (rejected item ids, {item id: new name}), or None if the run was cancelled."""
     run_id = secrets.token_hex(8)
     REVIEW_FILE.unlink(missing_ok=True)
     STATUS.update(state="review", step="waiting for approval", run_id=run_id, force=True)
@@ -512,7 +603,14 @@ def wait_for_review(items):
                     if isinstance(r, str) and r in items and items[r]["dir"] == "in"}
         for iid in rejected:
             log(f"Rejected on the dashboard: {items[iid]['name']}")
-        return rejected
+        renames = {}
+        raw = review.get("renames") if isinstance(review.get("renames"), dict) else {}
+        for iid, name in raw.items():
+            name = clean_name(name)
+            if (iid in items and items[iid]["dir"] == "in" and iid not in rejected and name
+                    and name != items[iid]["name"]):
+                renames[iid] = name
+        return rejected, renames
 
 
 def clean_up_emptied(src_dir, jobs, stops=None):
@@ -611,8 +709,11 @@ def import_media(root: Path, settings=None, incoming=False):
     if jobs and skip_existing:
         log("Skip-existing mode is on: files already in the library aren't copied.")
     keep = []
+    pairs = {}  # library drive mode: item id -> all its (src, dst), for renames
     for s, d, iid in jobs:
         item = items[iid]
+        if item["dir"] == "in":
+            pairs.setdefault(iid, []).append((s, d))
         if incoming:
             try:
                 fresh = time.time() - s.stat().st_mtime < INCOMING_SETTLE
@@ -654,7 +755,8 @@ def import_media(root: Path, settings=None, incoming=False):
     rejected = set()
     # Only what comes onto X4 is reviewed; the copy onto the drive always goes ahead.
     if library and not incoming and any(items[iid]["dir"] == "in" for _, _, iid in jobs):
-        rejected = wait_for_review(items)
+        review = wait_for_review(items)
+        rejected, renames = review if review else (None, {})
         if rejected is None:
             for item in items.values():
                 if item["state"] == "waiting":
@@ -664,6 +766,13 @@ def import_media(root: Path, settings=None, incoming=False):
         for iid in rejected:
             items[iid]["state"] = "rejected"
         jobs = [j for j in jobs if j[2] not in rejected]
+        if renames:
+            new_jobs, now_existing = apply_renames(renames, items, pairs, found, skip_existing)
+            existing += now_existing - sum(1 for iid in renames for s, d in pairs[iid]
+                                            if skip_existing and already_there(d, MOVIES_DIR))
+            jobs = [j for j in jobs if j[2] not in new_jobs] + [j for js in new_jobs.values() for j in js]
+            jobs.sort(key=lambda j: items[j[2]]["dir"] == "out")  # imports first, then the copy onto the drive
+            STATUS.update(items=list(items.values()), existing=existing, force=True)
         STATUS.update(state="plugged_in", step="scanning", rejected=len(rejected), force=True)
         if not jobs:
             log("Everything was rejected; nothing to copy.")
@@ -717,6 +826,12 @@ def import_media(root: Path, settings=None, incoming=False):
         out = item["dir"] == "out"
         rel = Path("To the drive") / s.relative_to(LIBRARY_ROOT) if out else s.relative_to(base)
         if item["state"] == "no_space":
+            continue
+        if out and d.exists():  # appeared since the scan (a rename on the drive): never overwrite
+            log(f"  Already on the drive now, not copied: {d.name}")
+            item["copy"] -= 1
+            if item["done"] + item["failed"] >= item["copy"]:
+                item["state"] = "failed" if item["failed"] else "done" if item["done"] else "in_library"
             continue
         if out and item["state"] == "waiting":
             # Each title only goes onto the drive if all of it fits; never a half-copied movie or show.
@@ -857,12 +972,31 @@ def handle_device(dev):
     else:
         # Only deleting from the drive writes to it.
         needs_write = settings["delete_after"] and (Path(mnt) / SOURCE_FOLDERS[settings["source"]]).is_dir()
+    writable = {"ok": not we_mounted, "tried": False}
+
+    def make_writable():
+        """Switch the drive to read-write the first time a rename on it needs that."""
+        if writable["ok"] or writable["tried"]:
+            return writable["ok"]
+        writable["tried"] = True
+        run(["umount", mnt])
+        if run(["mount", "-o", "rw,noatime", dev, mnt]).returncode == 0:
+            writable["ok"] = True
+            log(f"{dev} switched to read-write for renaming")
+        else:
+            run(["mount", "-o", "ro,noatime", dev, mnt])
+            log(f"Could not switch {dev} to read-write; renaming in the library only")
+        return writable["ok"]
+
+    global drive_writable
+    drive_writable = make_writable
     try:
         if we_mounted and needs_write:
             # Unmount and mount again read-write. (An in-place "remount,rw" isn't supported
             # by every filesystem driver, e.g. FUSE exFAT.)
             run(["umount", mnt])
             r = run(["mount", "-o", "rw,noatime", dev, mnt])
+            writable["ok"] = r.returncode == 0
             if r.returncode != 0:
                 log(f"Could not remount {dev} read-write: {r.stderr.strip()}")
                 if not settings["library_drive"]:
@@ -873,6 +1007,7 @@ def handle_device(dev):
                     STATUS.finish("mount_failed", "Couldn't mount the drive")
                     return 1
                 settings = {**settings, "export_library": False}
+                writable["tried"] = True  # no point trying again for a rename
                 STATUS.update(note="Couldn't write to this drive (Windows may have left it hibernated: shut "
                                    "Windows down fully, or run chkdsk), so the library wasn't copied onto it")
         return import_media(Path(mnt), settings)
