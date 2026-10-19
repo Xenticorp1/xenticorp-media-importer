@@ -145,7 +145,7 @@ class Status:
                      "total": 0, "index": 0, "file": None, "bytes_total": 0, "bytes_done": 0,
                      "imported": 0, "failed": 0, "skipped": 0, "existing": 0, "failed_files": [],
                      "mode": None, "items": [], "run_id": None, "rejected": 0, "exported": 0,
-                     "no_space": 0, "drive_free": None, "deletes": None, "note": None, "result": None, "message": None}
+                     "no_space": 0, "drive_free": None, "deletes": None, "renamed": 0, "note": None, "result": None, "message": None}
         self.write(force=True)
         threading.Thread(target=self._beat, daemon=True).start()
 
@@ -520,20 +520,64 @@ def renamed(path, top, old, new, folder=None):
     return top.joinpath(*parts)
 
 
-def apply_renames(renames, items, pairs, found, skip_existing):
-    """Library drive mode: rename approved titles. pairs: item id -> every (src, dst) of that title (also
-    ones skipped as already in the library). The drive is renamed too when it can be written; the
-    destinations always are, and "already in the library" is checked again under the new name.
-    Returns (item id -> new (src, dst) jobs, number of files now already in the library)."""
-    new_jobs, existing, drive_failed = {}, 0, []
+def library_title_moves(item, old, new, old_target, new_target):
+    """Where the copy of this title that's already in the library goes when it's renamed: (from, to) for
+    every file. A movie: its folder, or its loose files (not tidied yet). A show: every file in its library
+    folder, into the new show folder, with the old show name at the start of a file swapped (the drive's
+    name for it, or the library folder's)."""
+    moves = []
+    if item["kind"] == "movie":
+        if (MOVIES_DIR / old).is_dir():
+            moves += [(f, renamed(f, MOVIES_DIR, old, new)) for f in walk_files(MOVIES_DIR / old)]
+        stems = loose_video_stems(MOVIES_DIR)
+        for f in sorted(MOVIES_DIR.iterdir()):
+            if f.is_file() and not is_junk(f.name) and movie_name(Path(f.name), stems) == old:
+                moves.append((f, MOVIES_DIR / swap_prefix(f.name, old, new)))
+    elif old_target and (SHOWS_DIR / old_target).is_dir():
+        for f in walk_files(SHOWS_DIR / old_target):
+            parts = list(f.relative_to(SHOWS_DIR).parts)
+            parts[0] = new_target
+            name = parts[-1]
+            parts[-1] = swap_prefix(name, old, new) if name.startswith(old) else swap_prefix(name, old_target, new)
+            moves.append((f, SHOWS_DIR.joinpath(*parts)))
+    return [(a, b) for a, b in moves if a != b]
+
+
+def apply_renames(renames, items, pairs, found, rejected=()):
+    """Library drive mode: rename titles picked on the dashboard. pairs: item id -> every (src, dst) of that
+    title, also the ones already in the library. For each title:
+    - the copy already in the library (if any) is renamed in place, folder and files;
+    - the drive is renamed too, when it can be written;
+    - then only what isn't in the library under the new name is copied (whatever the skip-existing switch
+      says: a rename never copies a title again), and nothing at all for a rejected title.
+    Nothing is ever overwritten: a file whose new name is taken stays as it was and is reported.
+    Returns (item id -> new (src, dst) jobs, how many titles were renamed)."""
+    new_jobs, kept, done, read_only = {}, [], 0, False
     for iid, new in renames.items():
         item, old = items[iid], items[iid]["name"]
         movie = item["kind"] == "movie"
-        target = None
+        old_target, target = item.get("target"), None
         if not movie:
+            # An existing library show matching the new name (maybe the same one) takes the episodes;
+            # otherwise the show folder gets the new name (the library's copy is moved into it below).
             show_dir, exists = find_show_dir(new)
-            target, item["target"], item["new"] = show_dir.name, show_dir.name, not exists
+            target = show_dir.name if exists else new
+            had_copy = bool(old_target) and (SHOWS_DIR / old_target).is_dir()
+            item["target"], item["new"] = target, not exists and not had_copy
         log(f"Renaming '{old}' -> '{new}'" + (f" (library: {target})" if target and target != new else ""))
+        # 1. The copy already in the library.
+        for a, b in library_title_moves(item, old, new, old_target, target):
+            if b.exists():
+                log(f"  In the library, {b} already exists; left {a.name} as it is")
+                kept.append(a.name)
+                continue
+            try:
+                os.renames(a, b)  # makes the new folder, prunes the emptied old one
+                log(f"  Library: {a.relative_to(LIBRARY_ROOT)} -> {b.relative_to(LIBRARY_ROOT)}")
+            except OSError as e:
+                log(f"  Couldn't rename {a} in the library: {e}")
+                kept.append(a.name)
+        # 2. The drive.
         top_src = found["movies" if movie else "shows"]
         moved = {}
         if drive_writable():
@@ -543,26 +587,27 @@ def apply_renames(renames, items, pairs, found, skip_existing):
                     continue
                 if dst.exists():
                     log(f"  On the drive, {dst.name} already exists; left {src.name} as it is")
-                    drive_failed.append(src.name)
+                    kept.append(src.name)
                     continue
                 try:
-                    os.renames(src, dst)  # makes the new folder, prunes the emptied old one
+                    os.renames(src, dst)
                     moved[src] = dst
                 except OSError as e:
                     log(f"  Couldn't rename {src} on the drive: {e}")
-                    drive_failed.append(src.name)
+                    kept.append(src.name)
         else:
-            drive_failed.append(old)
+            read_only = True
+        # 3. What's left to copy, under the new name.
         jobs = []
         item.update(files=0, existing=0, copy=0, bytes=0, renamed=new)
         for src, dst in pairs[iid]:
             src = moved.get(src, src)
             dst = renamed(dst, MOVIES_DIR if movie else SHOWS_DIR, old, new, None if movie else target)
             item["files"] += 1
-            if skip_existing and already_there(dst, MOVIES_DIR):
-                log(f"  Skipping '{dst.name}': already in the library under the new name")
+            if already_there(dst, MOVIES_DIR):
                 item["existing"] += 1
-                existing += 1
+                continue
+            if iid in rejected:
                 continue
             try:
                 item["bytes"] += src.stat().st_size
@@ -570,14 +615,20 @@ def apply_renames(renames, items, pairs, found, skip_existing):
                 pass
             item["copy"] += 1
             jobs.append((src, dst, iid))
-        item["state"] = "waiting" if item["copy"] else "in_library"
+        if iid not in rejected:
+            item["state"] = "waiting" if item["copy"] else "in_library"
         new_jobs[iid] = jobs
-    if drive_failed:
-        note = ("Renamed in the library only: this drive couldn't be written (Windows may have left it hibernated)"
-                if not drive_writable() else
-                f"Couldn't rename {len(drive_failed)} file(s) on the drive: " + ", ".join(drive_failed[:5]))
-        STATUS.update(note="; ".join(n for n in (STATUS.data.get("note") if STATUS.data else None, note) if n))
-    return new_jobs, existing
+        done += 1
+    notes = [STATUS.data.get("note") if STATUS.data else None]
+    if read_only:
+        notes.append("Renamed in X4's library only: this drive couldn't be written (Windows may have left it "
+                     "hibernated), so it keeps the old names")
+    if kept:
+        notes.append(f"{len(kept)} file(s) kept their old name because the new one was taken or couldn't be "
+                     "written: " + ", ".join(kept[:5]) + (", ..." if len(kept) > 5 else ""))
+    if len(notes) > 1:
+        STATUS.update(note="; ".join(n for n in notes if n))
+    return new_jobs, done
 
 
 def wait_for_review(items):
@@ -607,8 +658,8 @@ def wait_for_review(items):
         raw = review.get("renames") if isinstance(review.get("renames"), dict) else {}
         for iid, name in raw.items():
             name = clean_name(name)
-            if (iid in items and items[iid]["dir"] == "in" and iid not in rejected and name
-                    and name != items[iid]["name"]):
+            # A rejected title can still be renamed: "rename on the drive / in the library, don't copy".
+            if iid in items and items[iid]["dir"] == "in" and name and name != items[iid]["name"]:
                 renames[iid] = name
         return rejected, renames
 
@@ -754,7 +805,9 @@ def import_media(root: Path, settings=None, incoming=False):
 
     rejected = set()
     # Only what comes onto X4 is reviewed; the copy onto the drive always goes ahead.
-    if library and not incoming and any(items[iid]["dir"] == "in" for _, _, iid in jobs):
+    # Every title from the drive is reviewed, even when nothing's new: that's also where titles get renamed.
+    renamed_count = 0
+    if library and not incoming and any(item["dir"] == "in" for item in items.values()):
         review = wait_for_review(items)
         rejected, renames = review if review else (None, {})
         if rejected is None:
@@ -767,18 +820,21 @@ def import_media(root: Path, settings=None, incoming=False):
             items[iid]["state"] = "rejected"
         jobs = [j for j in jobs if j[2] not in rejected]
         if renames:
-            new_jobs, now_existing = apply_renames(renames, items, pairs, found, skip_existing)
-            existing += now_existing - sum(1 for iid in renames for s, d in pairs[iid]
-                                            if skip_existing and already_there(d, MOVIES_DIR))
+            new_jobs, renamed_count = apply_renames(renames, items, pairs, found, rejected)
             jobs = [j for j in jobs if j[2] not in new_jobs] + [j for js in new_jobs.values() for j in js]
             jobs.sort(key=lambda j: items[j[2]]["dir"] == "out")  # imports first, then the copy onto the drive
-            STATUS.update(items=list(items.values()), existing=existing, force=True)
+            existing = sum(i["existing"] for i in items.values() if i["dir"] == "in")
+            STATUS.update(items=list(items.values()), existing=existing, renamed=renamed_count, force=True)
         STATUS.update(state="plugged_in", step="scanning", rejected=len(rejected), force=True)
-        if not jobs:
-            log("Everything was rejected; nothing to copy.")
-            STATUS.finish("cancelled", "Everything was rejected on the dashboard; nothing was copied")
+        if not jobs and (renamed_count or rejected):
+            what = [f"Renamed {renamed_count} title{'s' if renamed_count != 1 else ''}"] if renamed_count else []
+            if rejected:
+                what.append(f"{len(rejected)} rejected")
+            log("; ".join(what) + "; nothing to copy.")
+            STATUS.finish("ok" if renamed_count else "cancelled", "; ".join(what) + "; nothing was copied")
             return 0
     left_note = "; ".join(n for n in (
+        renamed_count and f"Renamed {renamed_count} title{'s' if renamed_count != 1 else ''}",
         existing and f"{existing} file{'s' if existing != 1 else ''} already in the library"
                      + (", removed from incoming" if incoming else f", left {place}" if delete else ", not copied"),
         recent and f"{recent} file{'s' if recent != 1 else ''} changed in the last {INCOMING_SETTLE // 60} minutes"

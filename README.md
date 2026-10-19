@@ -36,10 +36,13 @@ when a drive is plugged in; a missing or broken file means all defaults.
   Each title can also be **renamed** there (`"renames": {id: "New Name"}` in `review.json`): a movie's
   folder and every file starting with its old name (`Heat/Heat.en.srt` -> `Heat (1995)/Heat (1995).en.srt`),
   or a show's folder and the show-name part at the start of each episode file (`Dr Who - S01E01.mkv` ->
-  `Doctor Who (2005) - S01E01.mkv`; a new show name matching a library show goes into that show). It
-  applies to the library copy and to the drive itself, which is switched to read-write just for that; if
-  the drive can't be written, only the library copy gets the new name and the run says so. "Already in the
-  library" is checked under the new name, and nothing on the drive is ever overwritten.
+  `Doctor Who (2005) - S01E01.mkv`; a new name matching another library show moves the episodes into it).
+  A rename covers every copy: the one already in X4's library is renamed in place (nothing is copied again,
+  whatever the skip-existing switch says), and the drive's is renamed too (it's switched to read-write just
+  for that; if it can't be written, only the library is renamed and the run says so). A rejected title is
+  still renamed, just not copied, so rename + reject fixes names without importing anything. Nothing is ever
+  overwritten: a file whose new name is taken keeps its old name and is reported. Because renaming happens
+  here, a library drive is always reviewed, even when nothing on it is new.
   - **Copy the library onto the drive** (`"export_library"`, a sub-switch, off by default; ignored unless
     library drive mode is on): for swapping media with someone. After the imports, everything in X4's
     library that isn't on the drive yet is copied into the drive's `Movies/` and `Shows/` (made if
