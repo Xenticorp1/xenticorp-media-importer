@@ -48,6 +48,10 @@ when a drive is plugged in; a missing or broken file means all defaults.
   renames of titles still there; once a run is over and the drive is still plugged in, it asks X4 (through
   the tidy path unit, `{"action": "drive", "device": "sdb1"}`) to run the importer on that drive again,
   which waits for approval as usual. That only happens while library drive mode is still on.
+  **Check drive** (in the card's Tidy section, while the list waits) is Tidy library for the drive's
+  `Movies/`: it shows which loose movies would move into a folder each (`{"run_id": ..., "tidy": "plan"}`)
+  and the list keeps waiting; moving them (`"tidy": "run"`) switches the drive to read-write, never
+  overwrites, and then reads the drive again. Nothing is copied by either.
   - **Copy the library onto the drive** (`"export_library"`, a sub-switch, off by default; ignored unless
     library drive mode is on): for swapping media with someone. After the imports, everything in X4's
     library that isn't on the drive yet is copied into the drive's `Movies/` and `Shows/` (made if

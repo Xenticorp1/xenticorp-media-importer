@@ -631,10 +631,11 @@ def apply_renames(renames, items, pairs, found, rejected=()):
     return new_jobs, done
 
 
-def wait_for_review(items):
+def wait_for_review(items, on_tidy=None):
     """Library drive mode: show the list on the dashboard and wait until it's approved there.
     Returns (rejected item ids, {item id: new name}), None if the run was cancelled, or "reload"
-    to scan the drive again (Reload button)."""
+    to scan the drive again (Reload button, and after Tidy drive moved things).
+    on_tidy(action, request id, run id): the Tidy drive buttons; a plan keeps waiting on the same list."""
     run_id = secrets.token_hex(8)
     REVIEW_FILE.unlink(missing_ok=True)
     STATUS.update(state="review", step="waiting for approval", run_id=run_id, force=True)
@@ -654,6 +655,13 @@ def wait_for_review(items):
         if review.get("reload") is True:
             log("Reloading the drive (asked on the dashboard)...")
             return "reload"
+        if review.get("tidy") in ("plan", "run") and on_tidy:
+            request_id = review.get("id") if isinstance(review.get("id"), str) else None
+            on_tidy(review["tidy"], request_id, run_id)
+            if review["tidy"] == "run":
+                return "reload"  # files moved: the list is read again
+            STATUS.update(force=True)  # still waiting
+            continue
         rejected = {r for r in review.get("rejected") or []
                     if isinstance(r, str) and r in items and items[r]["dir"] == "in"}
         for iid in rejected:
@@ -812,7 +820,7 @@ def import_media(root: Path, settings=None, incoming=False):
     # Every title from the drive is reviewed, even when nothing's new: that's also where titles get renamed.
     renamed_count = 0
     if library and not incoming and any(item["dir"] == "in" for item in items.values()):
-        review = wait_for_review(items)
+        review = wait_for_review(items, lambda action, rid, run_id: tidy_drive(action, rid, found, run_id))
         if review == "reload":  # scan everything again: renames made by hand, files added, ...
             STATUS.update(state="plugged_in", items=[], run_id=None, existing=0, force=True)
             return import_media(root, settings)
@@ -1114,13 +1122,14 @@ def tidy_write(data):
         print(f"(couldn't write {TIDY_STATUS}: {e})", flush=True)
 
 
-def tidy_plan():
-    """Loose files in movies/, grouped by the movie folder they'd move into. A file only belongs to a
+def tidy_plan(movies_dir=None):
+    """Loose files in movies/ (the library's, or a library drive's Movies/), grouped by the movie folder they'd move into. A file only belongs to a
     movie if its name starts with that movie's video name; anything else (a stray poster.jpg) stays.
     Returns ([{"name", "files", "conflicts"}], [names left where they are])."""
-    stems = loose_video_stems(MOVIES_DIR)
+    movies_dir = movies_dir or MOVIES_DIR
+    stems = loose_video_stems(movies_dir)
     plan, left = {}, []
-    for e in sorted(MOVIES_DIR.iterdir(), key=lambda p: p.name.lower()):
+    for e in sorted(movies_dir.iterdir(), key=lambda p: p.name.lower()):
         if not e.is_file() or e.name.startswith(".") or is_junk(e.name):
             continue
         name = next((st for st in stems if e.name.startswith(st)), None)
@@ -1129,47 +1138,59 @@ def tidy_plan():
             continue
         movie = plan.setdefault(name, {"name": name, "files": [], "conflicts": []})
         # Never overwrite: a file already in the movie's folder under the same name stays loose.
-        movie["conflicts" if (MOVIES_DIR / name / e.name).exists() else "files"].append(e.name)
+        movie["conflicts" if (movies_dir / name / e.name).exists() else "files"].append(e.name)
     return [m for m in plan.values() if m["files"] or m["conflicts"]], left
+
+
+def tidy_data(action, request_id, target="library", run_id=None):
+    data = {"v": 1, "id": request_id, "action": action, "state": "planning" if action == "plan" else "running",
+            "target": target, "run_id": run_id,  # a library drive: tidied while its review waits (run_id)
+            "started": int(time.time()), "finished": None, "movies": [], "left": [], "moved": 0,
+            "movies_moved": 0, "conflicts": 0, "message": None}
+    tidy_write(data)
+    return data
 
 
 def tidy(action, request_id=None):
     """action "plan": write what would move to TIDY_STATUS. "run": move it. Library moves are renames on
     the same drive, so they're instant and nothing is copied."""
-    data = {"v": 1, "id": request_id, "action": action, "state": "planning" if action == "plan" else "running",
-            "started": int(time.time()), "finished": None, "movies": [], "left": [], "moved": 0,
-            "movies_moved": 0, "conflicts": 0, "message": None}
-    tidy_write(data)
+    data = tidy_data(action, request_id)
     if not MOVIES_DIR.is_dir() or fs_of(LIBRARY_ROOT, "TARGET") == "/":
         data.update(state="failed", finished=int(time.time()),
                     message="The library drive isn't mounted, so nothing was moved")
         tidy_write(data)
         return 2
-    movies, left = tidy_plan()
+    return tidy_moves(MOVIES_DIR, action, data)
+
+
+def tidy_moves(movies_dir, action, data):
+    """Plan (and for "run", do) the tidy of movies_dir, keeping TIDY_STATUS up to date."""
+    movies, left = tidy_plan(movies_dir)
     data.update(movies=movies, left=left, conflicts=sum(len(m["conflicts"]) for m in movies))
+    where = "Tidy drive" if data.get("target") == "drive" else "Tidy"
     if action == "plan":
         n = sum(1 for m in movies if m["files"])
-        log(f"Tidy plan: {n} movie{'s' if n != 1 else ''} to move into folders, {len(left)} loose file(s) stay")
+        log(f"{where} plan: {n} movie{'s' if n != 1 else ''} to move into folders, {len(left)} loose file(s) stay")
         data.update(state="ready", finished=int(time.time()))
         tidy_write(data)
         return 0
     failed = []
     for m in movies:
-        folder = MOVIES_DIR / m["name"]
+        folder = movies_dir / m["name"]
         moved_any = False
         for name in m["files"]:
-            src, dst = MOVIES_DIR / name, folder / name
+            src, dst = movies_dir / name, folder / name
             try:
                 folder.mkdir(exist_ok=True)
                 if dst.exists():  # appeared since the plan: leave it
                     m["conflicts"].append(name)
                     continue
                 os.rename(src, dst)
-                log(f"Tidy: {name} -> {folder.name}/")
+                log(f"{where}: {name} -> {folder.name}/")
                 data["moved"] += 1
                 moved_any = True
             except OSError as e:
-                log(f"Tidy: couldn't move {name}: {e}")
+                log(f"{where}: couldn't move {name}: {e}")
                 failed.append(name)
         data["movies_moved"] += moved_any
         tidy_write(data)
@@ -1182,8 +1203,25 @@ def tidy(action, request_id=None):
         msg.append(f"{len(failed)} file(s) couldn't be moved: " + ", ".join(failed[:5]))
     data.update(state="failed" if failed else "done", finished=int(time.time()), message="; ".join(msg))
     tidy_write(data)
-    log("Tidy: " + data["message"])
+    log(f"{where}: " + data["message"])
     return 1 if failed else 0
+
+
+def tidy_drive(action, request_id, found, run_id):
+    """The Tidy drive button, while a library drive waits for approval: the same as Tidy library, on the
+    drive's Movies folder. The drive is switched to read-write only to move things."""
+    data = tidy_data(action, request_id, "drive", run_id)
+    movies_dir = found.get("movies")
+    if movies_dir is None:
+        data.update(state="done", finished=int(time.time()), message="This drive has no Movies folder to tidy")
+        tidy_write(data)
+        return 0
+    if action == "run" and not drive_writable():
+        data.update(state="failed", finished=int(time.time()),
+                    message="Couldn't write to this drive (Windows may have left it hibernated), so nothing was moved")
+        tidy_write(data)
+        return 1
+    return tidy_moves(movies_dir, action, data)
 
 
 def tidy_request():
