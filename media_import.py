@@ -633,7 +633,8 @@ def apply_renames(renames, items, pairs, found, rejected=()):
 
 def wait_for_review(items):
     """Library drive mode: show the list on the dashboard and wait until it's approved there.
-    Returns (rejected item ids, {item id: new name}), or None if the run was cancelled."""
+    Returns (rejected item ids, {item id: new name}), None if the run was cancelled, or "reload"
+    to scan the drive again (Reload button)."""
     run_id = secrets.token_hex(8)
     REVIEW_FILE.unlink(missing_ok=True)
     STATUS.update(state="review", step="waiting for approval", run_id=run_id, force=True)
@@ -650,6 +651,9 @@ def wait_for_review(items):
         if review.get("cancel") is True:
             log("Cancelled on the dashboard.")
             return None
+        if review.get("reload") is True:
+            log("Reloading the drive (asked on the dashboard)...")
+            return "reload"
         rejected = {r for r in review.get("rejected") or []
                     if isinstance(r, str) and r in items and items[r]["dir"] == "in"}
         for iid in rejected:
@@ -809,6 +813,9 @@ def import_media(root: Path, settings=None, incoming=False):
     renamed_count = 0
     if library and not incoming and any(item["dir"] == "in" for item in items.values()):
         review = wait_for_review(items)
+        if review == "reload":  # scan everything again: renames made by hand, files added, ...
+            STATUS.update(state="plugged_in", items=[], run_id=None, existing=0, force=True)
+            return import_media(root, settings)
         rejected, renames = review if review else (None, {})
         if rejected is None:
             for item in items.values():
@@ -1002,8 +1009,14 @@ def acquire_mount(dev):
     return None, False
 
 
-def handle_device(dev):
+def handle_device(dev, reload=False):
+    """reload: the dashboard's Reload drive button, after a library drive run finished. Only goes
+    ahead in library drive mode, so nothing is copied before the list has been approved again."""
     dev = os.path.realpath(dev)
+    if reload and not Path(dev).is_block_device():
+        STATUS.start(None, None)
+        STATUS.finish("mount_failed", f"{os.path.basename(dev)} isn't plugged in any more, so it couldn't be reloaded")
+        return 1
     uuid = run(["blkid", "-s", "UUID", "-o", "value", dev]).stdout.strip().lower()
     if uuid and uuid in ignored_uuids():
         log(f"{dev} (UUID {uuid}) is on the ignore list, skipping.")
@@ -1022,6 +1035,17 @@ def handle_device(dev):
     log(f"{dev} mounted at {mnt}")
 
     settings = load_settings()
+    if reload and not settings["library_drive"]:
+        log("Reload asked for, but library drive mode is off; not importing.")
+        STATUS.finish("cancelled", "Library drive mode is off, so the drive wasn't reloaded "
+                                   "(that would import without approval); unplug it and plug it in again")
+        if we_mounted:
+            run(["umount", mnt])
+            try:
+                os.rmdir(mnt)
+            except OSError:
+                pass
+        return 0
     # Library drive mode only reads the drive (stays read-only) unless the library is copied onto it.
     if settings["library_drive"]:
         needs_write = settings["export_library"]
@@ -1164,14 +1188,18 @@ def tidy(action, request_id=None):
 
 def tidy_request():
     """The dashboard's request (TIDY_REQUEST), removed as soon as it's read so systemd's path unit
-    doesn't start this again. Returns (action, id)."""
+    doesn't start this again. Returns (action, id); for "drive" the id is the device to reload (sdb1)."""
     try:
         req = json.loads(TIDY_REQUEST.read_text())
     except (OSError, ValueError):
         req = {}
     TIDY_REQUEST.unlink(missing_ok=True)
     req = req if isinstance(req, dict) else {}
-    action = req.get("action") if req.get("action") in ("run", "incoming") else "plan"
+    action = req.get("action") if req.get("action") in ("run", "incoming", "drive") else "plan"
+    if action == "drive":
+        device = req.get("device")
+        ok = isinstance(device, str) and re.fullmatch(r"[a-z][a-z0-9]{1,30}", device or "")
+        return ("drive", device) if ok else ("plan", None)
     return action, req.get("id") if isinstance(req.get("id"), str) else None
 
 
@@ -1204,8 +1232,13 @@ def main():
         else:
             print(__doc__)
             return 64
-        # The same path unit also carries the dashboard's Sort incoming button.
-        target = sort_incoming if action == "incoming" else lambda: tidy(action, request_id)
+        # The same path unit also carries the dashboard's Sort incoming and Reload drive buttons.
+        if action == "incoming":
+            target = sort_incoming
+        elif action == "drive":
+            target = lambda: handle_device(f"/dev/{request_id}", reload=True)
+        else:
+            target = lambda: tidy(action, request_id)
     elif sys.argv[1:] == ["--incoming"]:
         target = sort_incoming
     elif len(sys.argv) == 2:

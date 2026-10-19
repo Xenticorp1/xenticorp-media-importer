@@ -43,6 +43,11 @@ when a drive is plugged in; a missing or broken file means all defaults.
   still renamed, just not copied, so rename + reject fixes names without importing anything. Nothing is ever
   overwritten: a file whose new name is taken keeps its old name and is reported. Because renaming happens
   here, a library drive is always reviewed, even when nothing on it is new.
+  **Reload drive** on the card reads the drive again, to double-check it: while waiting
+  (`{"run_id": ..., "reload": true}`) it rescans and waits for a fresh approval, keeping the rejects and
+  renames of titles still there; once a run is over and the drive is still plugged in, it asks X4 (through
+  the tidy path unit, `{"action": "drive", "device": "sdb1"}`) to run the importer on that drive again,
+  which waits for approval as usual. That only happens while library drive mode is still on.
   - **Copy the library onto the drive** (`"export_library"`, a sub-switch, off by default; ignored unless
     library drive mode is on): for swapping media with someone. After the imports, everything in X4's
     library that isn't on the drive yet is copied into the drive's `Movies/` and `Shows/` (made if
