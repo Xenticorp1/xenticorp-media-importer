@@ -28,6 +28,12 @@ Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.jso
   (subtitles, artwork, .nfo): Heat (1995).mkv + Heat (1995).en.srt ->
   <library>/movies/Heat (1995)/. Also used when copying onto a library drive.
 
+Music: a "Music" folder on the drive (any capitals, any mode except Sort incoming) goes into
+<library>/music with its layout kept (Music/<Album>/01 - Track.mp3 -> music/<Album>/01 - Track.mp3),
+one dashboard item per album. Only audio, cover art and .lrc lyrics are taken. The dashboard's music
+uploads land in /var/lib/media-import/upload/Music/ and are moved in the same way (--music-uploads,
+or the dashboard's "music" request).
+
 Sort incoming (the dashboard's "Sort incoming" button, or --incoming by hand):
 everything inside INCOMING_DIR's movies/ and shows/ folders goes into the library
 the same way as a library drive (movie folders, show matching), then is removed
@@ -79,6 +85,11 @@ from pathlib import Path
 LIBRARY_ROOT = Path("/mnt/media/jellyfin/media")
 MOVIES_DIR = LIBRARY_ROOT / "movies"
 SHOWS_DIR = LIBRARY_ROOT / "shows"
+MUSIC_DIR = LIBRARY_ROOT / "music"  # laid out Album/01 - Track.mp3
+MUSIC_FOLDER = "Music"  # on a drive (any mode but Sort incoming), next to the other folders; any capitals
+MUSIC_EXTS = {".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".wma",
+              ".jpg", ".jpeg", ".png", ".lrc"}  # audio, plus cover art and lyrics
+UPLOAD_DIR = Path("/var/lib/media-import/upload")  # the dashboard's music uploads land in upload/Music/
 INCOMING_DIR = Path("/home/greygamer14/incoming")  # Sort incoming: holds movies/ and shows/
 INCOMING_SETTLE = 120  # seconds a file must have been left alone before Sort incoming takes it
 SOURCE_FOLDERS = {"compressed": "Compressed Media", "ripped": "Ripped Media"}  # picked on the dashboard
@@ -339,6 +350,30 @@ def already_there(d, movies):
     return d.exists() or (d.parent.parent == movies and (movies / d.name).exists())
 
 
+def music_folder(root):
+    """root's Music folder, whatever its capitals, or None."""
+    try:
+        return next((e for e in root.iterdir() if e.is_dir() and e.name.lower() == MUSIC_FOLDER.lower()), None)
+    except OSError:
+        return None
+
+
+def scan_music(music_src, items):
+    """Music/<Album>/<file> -> MUSIC_DIR/<Album>/<file>, one dashboard item per album; files loose in
+    Music/ go loose into the music library ("Loose tracks"). Only audio, cover art and lyrics are taken."""
+    jobs = []
+    for f in walk_files(music_src):
+        rel = f.relative_to(music_src)
+        if f.suffix.lower() not in MUSIC_EXTS or f.name.startswith("."):
+            log(f"Music: skipping '{rel}' (not audio, cover art or lyrics)")
+            continue
+        album = rel.parts[0] if len(rel.parts) > 1 else "Loose tracks"
+        iid = add_item(items, "music", album, target=album if len(rel.parts) > 1 else None,
+                       new=not (MUSIC_DIR / rel.parts[0]).is_dir() if len(rel.parts) > 1 else False)
+        jobs.append((f, MUSIC_DIR / rel, iid))
+    return jobs
+
+
 def add_show(items, entry):
     show_dir, exists = find_show_dir(entry.name)
     log(f"Show '{entry.name}' -> {show_dir} ({'existing' if exists else 'new'})")
@@ -555,6 +590,8 @@ def apply_renames(renames, items, pairs, found, rejected=()):
     new_jobs, kept, done, read_only = {}, [], 0, False
     for iid, new in renames.items():
         item, old = items[iid], items[iid]["name"]
+        if item["kind"] == "music":  # albums aren't renamed here; their names are the folder names as given
+            continue
         movie = item["kind"] == "movie"
         old_target, target = item.get("target"), None
         if not movie:
@@ -695,23 +732,27 @@ def clean_up_emptied(src_dir, jobs, stops=None):
                 for x in leftovers:
                     x.unlink()
                 d.rmdir()
-                log(f"Removed emptied folder: {d.relative_to(src_dir)}")
+                log(f"Removed emptied folder: {d}")
         except OSError as e:
             log(f"  Could not remove {d}: {e}")
 
 
-def import_media(root: Path, settings=None, incoming=False):
+def import_media(root: Path, settings=None, incoming=False, uploads=False):
     """incoming: Sort incoming (root = INCOMING_DIR): laid out like a library drive, but everything is
     moved (copied, verified, removed), files already in the library are always skipped, and there's no
-    review and no copy back."""
+    review and no copy back.
+    uploads: the dashboard's music uploads (root = UPLOAD_DIR, holding Music/): only music, always moved.
+    A drive's Music folder is imported in every mode except Sort incoming."""
     settings = settings or load_settings()
-    library = settings["library_drive"] or incoming
+    library = (settings["library_drive"] or incoming) and not uploads
     folder = SOURCE_FOLDERS[settings["source"]]
     export = library and settings["export_library"] and not incoming
-    delete = incoming or (not library and settings["delete_after"])  # delete each file once it's verified
+    delete = incoming or uploads or (not library and settings["delete_after"])  # delete each file once it's verified
     skip_existing = incoming or settings["skip_existing"]
-    place = "in incoming" if incoming else "on the drive"  # where a file that isn't moved stays
-    mode = "incoming" if incoming else "library" if library else settings["source"]
+    place = "in incoming" if incoming else "in the upload folder" if uploads else "on the drive"  # where a file that isn't moved stays
+    mode = "upload" if uploads else "incoming" if incoming else "library" if library else settings["source"]
+    music_src = None if incoming else music_folder(root)
+    src_dir = None
     STATUS.update(step="scanning", mode=mode, deletes=delete, force=True)
     clashes = library_folder_clashes(root) if library else []
     if clashes:
@@ -720,7 +761,14 @@ def import_media(root: Path, settings=None, incoming=False):
         STATUS.finish("problems", f"Found {names}: move everything into one of them and delete the other. "
                                   "Nothing was copied.")
         return 1
-    if incoming:
+    found = {}
+    if uploads:
+        if not music_src:
+            STATUS.finish("nothing", "No uploaded music waiting")
+            return 0
+        base = root
+        log("Uploaded music: moving it into the music library.")
+    elif incoming:
         found = library_folders(root)
         if not found:
             log(f"No movies or shows folder in {root}, nothing to do.")
@@ -731,7 +779,7 @@ def import_media(root: Path, settings=None, incoming=False):
         log(f"Sort incoming: moving what's in {where} into the library.")
     elif library:
         found = library_folders(root)
-        if not found and not export:
+        if not found and not export and not music_src:
             log(f"Library drive mode: no Movies or Shows folder on {root}, nothing to do.")
             STATUS.finish("no_folder", "Library drive mode is on, but this drive has no Movies or Shows folder")
             return 0
@@ -741,7 +789,7 @@ def import_media(root: Path, settings=None, incoming=False):
             + (" The library is copied onto the drive too." if export else ""))
     else:
         base = src_dir = root / folder
-        if not src_dir.is_dir():
+        if not src_dir.is_dir() and not music_src:
             log(f"No '{folder}' folder on {root}, nothing to do.")
             STATUS.finish("no_folder", f"No '{folder}' folder on this drive")
             return 0
@@ -758,13 +806,27 @@ def import_media(root: Path, settings=None, incoming=False):
 
     items = {}  # the movies and shows found, for the dashboard
     orphans = []  # season folders sitting directly in Shows/ (library drive / incoming)
-    if library:
+    if uploads:
+        jobs, skipped = [], 0
+    elif library:
         folders = settings["movie_folders"]
         jobs, skipped = scan_library_drive(found, items, folders, orphans), 0  # (src, dst, item id); skipped = misplaced episodes
         if export:  # copied after the imports; never reviewed, everything new goes onto the drive
             jobs += scan_library_export(root, found, items, folders)
-    else:
+    elif src_dir.is_dir():
         jobs, skipped = scan_media_folder(src_dir, items, settings["movie_folders"])
+    else:
+        jobs, skipped = [], 0
+    if music_src:
+        music_jobs = scan_music(music_src, items)
+        jobs = [j for j in jobs if items[j[2]]["dir"] == "in"] + music_jobs + [j for j in jobs if items[j[2]]["dir"] == "out"]
+
+    def shown(path):
+        """A file's path for the log and the dashboard: from the source folder, the drive or the library."""
+        for top in (base, root, LIBRARY_ROOT):
+            if path.is_relative_to(top):
+                return path.relative_to(top)
+        return path
 
     existing = 0  # already in the library, left on the USB (skip-existing mode)
     dupes = []  # Sort incoming: those files, deleted from incoming at the end
@@ -783,13 +845,13 @@ def import_media(root: Path, settings=None, incoming=False):
             except OSError:
                 fresh = True
             if fresh:
-                log(f"Leaving '{s.relative_to(base)}' for next time: it changed in the last {INCOMING_SETTLE // 60} minutes")
+                log(f"Leaving '{shown(s)}' for next time: it changed in the last {INCOMING_SETTLE // 60} minutes")
                 recent += 1
                 item["recent"] = item.get("recent", 0) + 1
                 continue
         item["files"] += 1
-        if item["dir"] == "in" and skip_existing and already_there(d, MOVIES_DIR):
-            log(f"Skipping '{s.relative_to(base)}': already in the library")
+        if item["dir"] == "in" and skip_existing and (d.exists() if item["kind"] == "music" else already_there(d, MOVIES_DIR)):
+            log(f"Skipping '{shown(s)}': already in the library")
             existing += 1
             if incoming:
                 dupes.append(s)
@@ -884,7 +946,8 @@ def import_media(root: Path, settings=None, incoming=False):
             return 0
         STATUS.finish("nothing", ("Nothing new either way: the drive and the library have the same files"
                                   if export else f"Nothing in this drive's {where} folder{'s' if len(found) > 1 else ''}")
-                      if library else f"The '{folder}' folder is empty")
+                      if library else "No uploaded music waiting" if uploads
+                      else f"The '{folder}' folder is empty" if src_dir and src_dir.is_dir() else "The Music folder is empty")
         return 0
 
     total_bytes = sum(item["bytes"] for item in items.values() if item["id"] not in rejected)
@@ -895,7 +958,7 @@ def import_media(root: Path, settings=None, incoming=False):
     for i, (s, d, iid) in enumerate(jobs, 1):
         item = items[iid]
         out = item["dir"] == "out"
-        rel = Path("To the drive") / s.relative_to(LIBRARY_ROOT) if out else s.relative_to(base)
+        rel = Path("To the drive") / s.relative_to(LIBRARY_ROOT) if out else shown(s)
         if item["state"] == "no_space":
             continue
         if out and d.exists():  # appeared since the scan (a rename on the drive): never overwrite
@@ -945,7 +1008,8 @@ def import_media(root: Path, settings=None, incoming=False):
     if incoming:
         clear_incoming(found, dupes)
     elif delete:  # only folders this run emptied; nothing to tidy up when nothing was deleted
-        clean_up_emptied(base, jobs, found.values() if library else None)
+        # The Music folder itself, the drive's top and the library folders always stay.
+        clean_up_emptied(base, jobs, [*(found.values() if library else ()), *([music_src] if music_src else ()), root])
 
     os.sync()
     log(f"Done: {ok} imported, {len(failed)} failed, {skipped} skipped (misplaced episodes)"
@@ -1059,7 +1123,8 @@ def handle_device(dev, reload=False):
         needs_write = settings["export_library"]
     else:
         # Only deleting from the drive writes to it.
-        needs_write = settings["delete_after"] and (Path(mnt) / SOURCE_FOLDERS[settings["source"]]).is_dir()
+        needs_write = settings["delete_after"] and ((Path(mnt) / SOURCE_FOLDERS[settings["source"]]).is_dir()
+                                                    or music_folder(Path(mnt)) is not None)
     writable = {"ok": not we_mounted, "tried": False}
 
     def make_writable():
@@ -1233,7 +1298,7 @@ def tidy_request():
         req = {}
     TIDY_REQUEST.unlink(missing_ok=True)
     req = req if isinstance(req, dict) else {}
-    action = req.get("action") if req.get("action") in ("run", "incoming", "drive") else "plan"
+    action = req.get("action") if req.get("action") in ("run", "incoming", "drive", "music") else "plan"
     if action == "drive":
         device = req.get("device")
         ok = isinstance(device, str) and re.fullmatch(r"[a-z][a-z0-9]{1,30}", device or "")
@@ -1248,6 +1313,12 @@ def sort_incoming():
         STATUS.finish("no_folder", f"{INCOMING_DIR} doesn't exist")
         return 0
     return import_media(INCOMING_DIR, load_settings(), incoming=True)
+
+
+def import_uploads():
+    """The dashboard's music uploads (UPLOAD_DIR/Music/<Album>/...) into the music library."""
+    STATUS.start(None, "Uploaded music")
+    return import_media(UPLOAD_DIR, load_settings(), uploads=True)
 
 
 def stopped(signum, frame):
@@ -1275,10 +1346,14 @@ def main():
             target = sort_incoming
         elif action == "drive":
             target = lambda: handle_device(f"/dev/{request_id}", reload=True)
+        elif action == "music":
+            target = import_uploads
         else:
             target = lambda: tidy(action, request_id)
     elif sys.argv[1:] == ["--incoming"]:
         target = sort_incoming
+    elif sys.argv[1:] == ["--music-uploads"]:
+        target = import_uploads
     elif len(sys.argv) == 2:
         target = lambda: handle_device(sys.argv[1])
     else:

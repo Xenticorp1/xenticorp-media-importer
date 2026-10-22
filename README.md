@@ -149,3 +149,15 @@ partitions with no media don't overwrite a sibling partition's result while that
 journalctl -u 'media-import@*' -n 50
 sudo python3 media_import.py --dir /path/to/mounted/usb
 ```
+
+## Music
+
+- **From a drive:** a `Music` folder at the drive's root (next to `Compressed Media`, or on a library
+  drive) is imported into `/mnt/media/jellyfin/media/music`, keeping its layout: `Music/Album/01 - Track.mp3`
+  becomes `music/Album/01 - Track.mp3`. Only audio (MP3, FLAC, M4A, AAC, OGG, Opus, WAV, WMA), cover art
+  and `.lrc` lyrics are taken. The usual switches apply (delete after copying, skip existing), and in
+  library drive mode each album is reviewed like a movie or show.
+- **Uploaded on the dashboard:** files land in `/var/lib/media-import/upload/Music/<Album>/`, and the
+  dashboard's request (through the existing tidy path unit) runs `--music-uploads`, which moves them in
+  the same way. By hand: `sudo python3 media_import.py --music-uploads`.
+- Tests: `python3 -m unittest discover tests`.
