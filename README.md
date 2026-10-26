@@ -1,19 +1,120 @@
 # Xenticorp Media Import
 
-Headless USB to Jellyfin importer for a Linux media server. Plug in a USB with a `Compressed Media` folder at its root:
+Headless USB to Jellyfin importer for a Linux media server. Plug in a USB with a `Compressed Media` folder at its root (or `Ripped Media`, or a whole library drive; see [Settings](#settings)):
 
 | On the USB | Goes to |
 |---|---|
-| `Compressed Media/Movie.mkv` (or `.mp4`) | `/srv/jellyfin/media/movies/` |
+| `Compressed Media/Movie.mkv` (or `.mp4`) | `/srv/jellyfin/media/movies/Movie/Movie.mkv` |
+| `Compressed Media/Movie.en.srt`, `Movie-poster.jpg`... | `/srv/jellyfin/media/movies/Movie/` (with its movie) |
 | `Compressed Media/<Show>/Season N/...` | `/srv/jellyfin/media/shows/<Show>/Season N/...` |
 
 The library paths above are examples. Set yours with `LIBRARY_ROOT` in `media_import.py` and `LIB` in `install.sh`.
 
 - Show names match existing library folders ignoring case, punctuation and a trailing `(YYYY)`, so `The Big Bang Theory` goes into `The Big Bang Theory (2007)`.
 - Loose files at the root whose name contains an episode code (`S01E01`, `s1e1`, `1x01`) are not imported as movies: they're skipped, left on the USB, and the run exits non-zero so it shows as needing attention. Put them in a show folder.
-- Each file is copied, SHA-256 verified, then deleted from the USB. Existing library files are overwritten.
+- Each file is copied, SHA-256 verified, then deleted from the USB (switchable, see [Settings](#settings)). Existing library files are overwritten.
 - Folders the import empties are removed. Folders that were already empty stay on the USB.
 - The library drive is never touched (UUID ignore list). The importer refuses to run if the library isn't mounted.
+
+## Settings
+
+Switches on the Xenticorp dashboard's Importer card, saved in `/var/lib/media-import/settings.json`
+(e.g. `{"source": "ripped", "library_drive": true, "export_library": true, "skip_existing": true}`). The importer reads them
+when a drive is plugged in; a missing or broken file means all defaults.
+
+- **Importer on/off** (`"enabled"`, on unless set to `false`): when it's off, a drive that's plugged in is left
+  alone (not even mounted), and the dashboard shows "Importer off". Tidy, Sort incoming and music uploads, which
+  you start from the dashboard yourself, still work.
+- **Source folder** (`"source"`: `"compressed"`, the default, or `"ripped"`): which folder at the drive's root
+  is imported, `Compressed Media` or `Ripped Media`. Both work exactly as described above.
+- **Library drive mode** (`"library_drive"`, off by default): for a drive that's already laid out like a
+  library. Everything in its `Movies/` and `Shows/` folders (any case) is copied, videos, subtitles,
+  artwork and `.nfo` files alike, keeping the folders: `Movies/Heat (1995)/...` goes to
+  `movies/Heat (1995)/...`, and a show folder is matched to an existing library show as above. Nothing on
+  the drive is changed or deleted, so it's only mounted read-only. The source folder switch doesn't apply.
+  Before copying anything it waits for you on the dashboard: the card lists the movies and shows it found,
+  you reject the ones you don't want and press approve (or cancel), and only the rest is copied. The
+  answer comes back as `/var/lib/media-import/review.json` (`{"run_id": ..., "rejected": [ids]}` or
+  `"cancel": true`). Unplugging the drive while it waits stops the run, as always.
+  Each title can also be **renamed** there (`"renames": {id: "New Name"}` in `review.json`): a movie's
+  folder and every file starting with its old name (`Heat/Heat.en.srt` -> `Heat (1995)/Heat (1995).en.srt`),
+  or a show's folder and the show-name part at the start of each episode file (`Dr Who - S01E01.mkv` ->
+  `Doctor Who (2005) - S01E01.mkv`; a new name matching another library show moves the episodes into it).
+  A rename covers every copy: the one already in X4's library is renamed in place (nothing is copied again,
+  whatever the skip-existing switch says), and the drive's is renamed too (it's switched to read-write just
+  for that; if it can't be written, only the library is renamed and the run says so). A rejected title is
+  still renamed, just not copied, so rename + reject fixes names without importing anything. Nothing is ever
+  overwritten: a file whose new name is taken keeps its old name and is reported. Because renaming happens
+  here, a library drive is always reviewed, even when nothing on it is new.
+  **Reload drive** on the card reads the drive again, to double-check it: while waiting
+  (`{"run_id": ..., "reload": true}`) it rescans and waits for a fresh approval, keeping the rejects and
+  renames of titles still there; once a run is over and the drive is still plugged in, it asks X4 (through
+  the tidy path unit, `{"action": "drive", "device": "sdb1"}`) to run the importer on that drive again,
+  which waits for approval as usual. That only happens while library drive mode is still on.
+  **Check drive** (in the card's Tidy section, while the list waits) is Tidy library for the drive's
+  `Movies/`: it shows which loose movies would move into a folder each (`{"run_id": ..., "tidy": "plan"}`)
+  and the list keeps waiting; moving them (`"tidy": "run"`) switches the drive to read-write, never
+  overwrites, and then reads the drive again. Nothing is copied by either.
+  - **Copy the library onto the drive** (`"export_library"`, a sub-switch, off by default; ignored unless
+    library drive mode is on): for swapping media with someone. After the imports, everything in X4's
+    library that isn't on the drive yet is copied into the drive's `Movies/` and `Shows/` (made if
+    missing; a library show goes into the drive's folder for the same show, e.g. `Breaking Bad (2008)` into
+    `Breaking Bad`). Files already on the drive are never overwritten and the library is never changed.
+    These titles aren't part of the review: they're listed, but always copied (a cancel stops both ways).
+    Each title is only copied if all of it fits, leaving 512 MB free; ones that don't fit are reported.
+    This needs the drive read-write; if it can't be (e.g. Windows left it hibernated), the import still
+    runs read-only and the run says the library wasn't copied.
+- **Skip files already in the library** (`"skip_existing"`, off by default): a file whose name is already
+  at its spot in the library isn't copied (in the normal modes it stays on the USB). Works in every mode.
+  A movie still sitting loose in `movies/` counts too, so nothing is duplicated before you tidy.
+- **Movie folders** (`"movie_folders"`, **on** by default): each movie goes into a folder of its own, the
+  way Jellyfin likes it, along with the loose files whose names start with the movie's name (subtitles,
+  `-poster.jpg`, `.nfo`): `Heat (1995).mkv` + `Heat (1995).en.srt` -> `movies/Heat (1995)/`. Loose files
+  that don't belong to a movie are left on the USB. It applies to library drives too, both ways: a
+  drive with loose movies is sorted into folders in the library, and the library goes onto a drive in
+  folders. Off, movies land loose in `movies/` and other loose files are skipped, as before.
+
+- **Delete from the drive after copying** (`"delete_after"`, **on** by default): each file is deleted from
+  the USB once its copy is verified, and folders that empties are removed. Off, the import only copies:
+  everything stays on the USB, which is then only ever mounted read-only (so a drive Windows left
+  hibernated still imports). Library drive mode never deletes either way.
+
+## Sort incoming
+
+The dashboard's **Sort incoming** button (or `sudo python3 media_import.py --incoming`) moves everything
+inside `INCOMING_DIR`'s `movies/` and `shows/` folders into the library (set `INCOMING_DIR` at the top
+of `media_import.py`), then clears those two folders completely: the `movies/` and `shows/` folders
+themselves stay, everything inside them goes. That happens even when there was no media to move (empty
+folders, `Thumbs.db`, a stray `folder.jpg`).
+
+- Sorted the same way as a library drive: movie folders (if that switch is on) and show matching.
+- Each file is copied, SHA-256 verified, and only then removed from incoming (it's usually another drive).
+- A movie or show that's already in the library only gets its new files: anything already there under
+  the same name isn't copied, and is deleted from incoming (whatever the skip-existing switch says).
+- The only things left behind are media that isn't safely in the library, listed on the card: a file
+  whose copy failed, one still being written (below), and episodes not inside a show folder.
+- A file changed in the last 2 minutes is left for next time, in case it's still being written.
+- Two `movies` or two `shows` folders that differ only in capitals (`Shows` and `shows`) stop the run with
+  a message, since only one would be read; the same goes for a library drive. A season folder sitting
+  straight in `shows/` (`shows/Season 3/...`) is left where it is and reported: it needs to go inside a
+  folder named after its show (`shows/Metalocalypse/Season 3/...`).
+- Progress and the list of what moved show on the dashboard's Importer card, like an import. It runs
+  through the same path unit as Tidy, so there's nothing extra to install.
+
+## Tidy library
+
+The dashboard's **Tidy library** button sorts movies already sitting loose in `movies/` into a folder
+each, by the same rule. It first shows what would move; nothing moves until you confirm. Files are
+renamed in place (same drive, instant), never overwritten: if the folder already has a file with the same
+name, that one stays loose and is reported. Loose files that don't belong to a movie stay put. It waits
+for any running import (same lock).
+
+The dashboard asks for it by writing `/var/lib/media-import/tidy-request.json` (`"action"`: `"plan"`,
+`"run"`, or `"incoming"` for Sort incoming); `media-import-tidy.path` (installed by `install.sh`) runs
+`media_import.py --tidy`, which writes the plan or result to
+`/var/lib/media-import/tidy.json`. By hand: `sudo python3 media_import.py --tidy` (plan only) or
+`--tidy --run`. Jellyfin notices the moves on its own if real-time monitoring is on; otherwise run a
+library scan.
 
 ## Install
 
@@ -27,7 +128,7 @@ sudo ./install.sh
 
 ```bash
 cd /path/to/media-import && git pull
-# re-run sudo ./install.sh only if media-import@.service or 99-media-import.rules changed
+# re-run sudo ./install.sh only if a .service, .path or .rules file changed
 ```
 
 ## Status file
@@ -35,7 +136,12 @@ cd /path/to/media-import && git pull
 While it runs, the importer keeps `/var/lib/media-import/status.json` up to date: `plugged_in`
 (mounting, scanning), `running` (file N of M, current file, bytes copied) and `finished` (with a
 `result` of `ok`, `problems`, `no_folder`, `nothing`, `aborted`, `mount_failed`, `interrupted` or
-`error`, plus counts and a message). It's rewritten every 5 seconds during a run, so a stale
+`error`, plus counts, including `existing` for files skip-existing mode didn't copy, the `mode` (`compressed`,
+`ripped` or `library`), the movies and shows found (`items`, one per movie or show, with
+`dir` `in` (drive -> library) or `out` (library -> drive), file counts, sizes and how far each got;
+plus `exported`, `no_space` and `drive_free` when the library is copied onto the drive) and a message). In library drive mode the state goes `plugged_in` ->
+`review` (waiting for approval) -> `running` -> `finished`; a cancel or rejecting everything finishes
+with `cancelled`. It's rewritten every 5 seconds during a run, so a stale
 `updated` time means the importer died. The Xenticorp dashboard reads it to show the import status.
 Drives on the ignore list and the library drive never touch it. On a drive with several partitions,
 partitions with no media don't overwrite a sibling partition's result while that drive is plugged in.
@@ -46,3 +152,15 @@ partitions with no media don't overwrite a sibling partition's result while that
 journalctl -u 'media-import@*' -n 50
 sudo python3 media_import.py --dir /path/to/mounted/usb
 ```
+
+## Music
+
+- **From a drive:** a `Music` folder at the drive's root (next to `Compressed Media`, or on a library
+  drive) is imported into `/mnt/media/jellyfin/media/music`, keeping its layout: `Music/Album/01 - Track.mp3`
+  becomes `music/Album/01 - Track.mp3`. Only audio (MP3, FLAC, M4A, AAC, OGG, Opus, WAV, WMA), cover art
+  and `.lrc` lyrics are taken. The usual switches apply (delete after copying, skip existing), and in
+  library drive mode each album is reviewed like a movie or show.
+- **Uploaded on the dashboard:** files land in `/var/lib/media-import/upload/Music/<Album>/`, and the
+  dashboard's request (through the existing tidy path unit) runs `--music-uploads`, which moves them in
+  the same way. By hand: `sudo python3 media_import.py --music-uploads`.
+- Tests: `python3 -m unittest discover tests`.

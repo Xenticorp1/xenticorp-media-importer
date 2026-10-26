@@ -1,0 +1,9 @@
+[Unit]
+Description=Xenticorp Media Import: tidy loose movies into folders
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Waits for any running import first (same lock), so files never move under it.
+ExecStart=/usr/bin/python3 /opt/media-import/media_import.py --tidy
+TimeoutStartSec=infinity

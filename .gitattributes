@@ -4,3 +4,4 @@
 *.py text eol=lf
 *.service text eol=lf
 *.rules text eol=lf
+*.path text eol=lf
