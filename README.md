@@ -18,10 +18,13 @@ The library paths above are examples. Set yours with `LIBRARY_ROOT` in `media_im
 
 ## Settings
 
-Three switches on the Xenticorp dashboard's Importer card, saved in `/var/lib/media-import/settings.json`
+Switches on the Xenticorp dashboard's Importer card, saved in `/var/lib/media-import/settings.json`
 (e.g. `{"source": "ripped", "library_drive": true, "export_library": true, "skip_existing": true}`). The importer reads them
 when a drive is plugged in; a missing or broken file means all defaults.
 
+- **Importer on/off** (`"enabled"`, on unless set to `false`): when it's off, a drive that's plugged in is left
+  alone (not even mounted), and the dashboard shows "Importer off". Tidy, Sort incoming and music uploads, which
+  you start from the dashboard yourself, still work.
 - **Source folder** (`"source"`: `"compressed"`, the default, or `"ripped"`): which folder at the drive's root
   is imported, `Compressed Media` or `Ripped Media`. Both work exactly as described above.
 - **Library drive mode** (`"library_drive"`, off by default): for a drive that's already laid out like a

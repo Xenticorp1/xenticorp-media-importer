@@ -9,6 +9,9 @@ Runs when a USB drive is plugged in (via udev -> systemd). If the drive has a
   Compressed Media/<Show>/Season 01/...   -> <library>/shows/<Show>/Season 01/...
 
 Switches on the Xenticorp dashboard (saved in /var/lib/media-import/settings.json):
+- Importer on/off (on unless switched off): when it's off, a drive that's plugged in is
+  left alone (not even mounted) and the dashboard says so. The dashboard's own buttons
+  (Tidy, Sort incoming, music uploads) still work.
 - Ripped Media: import the "Ripped Media" folder instead, the same way.
 - Library drive mode: the drive is laid out like a library. Everything in its
   Movies/ and Shows/ folders (videos, subtitles, artwork, .nfo...) is copied:
@@ -214,8 +217,8 @@ def run(cmd):
 def load_settings():
     """The dashboard's switches. Anything missing or unreadable gets the default:
     Compressed Media, library drive mode off, existing library files overwritten."""
-    settings = {"source": "compressed", "library_drive": False, "export_library": False, "skip_existing": False,
-                "movie_folders": True, "delete_after": True}
+    settings = {"enabled": True, "source": "compressed", "library_drive": False, "export_library": False,
+                "skip_existing": False, "movie_folders": True, "delete_after": True}
     try:
         raw = json.loads(SETTINGS_FILE.read_text())
         if not isinstance(raw, dict):
@@ -233,6 +236,7 @@ def load_settings():
     settings["skip_existing"] = raw.get("skip_existing") is True
     settings["movie_folders"] = raw.get("movie_folders") is not False  # on unless switched off
     settings["delete_after"] = raw.get("delete_after") is not False  # likewise; never in library drive mode
+    settings["enabled"] = raw.get("enabled") is not False  # on unless the dashboard switched it off
     return settings
 
 
@@ -1100,6 +1104,11 @@ def handle_device(dev, reload=False):
 
     label = run(["blkid", "-s", "LABEL", "-o", "value", dev]).stdout.strip()
     STATUS.start(os.path.basename(dev), label)
+    if not load_settings()["enabled"]:
+        # Switched off on the dashboard: the drive isn't even mounted.
+        log(f"{dev}: the importer is switched off on the dashboard, leaving the drive alone.")
+        STATUS.finish("off", "The importer is switched off on the dashboard, so this drive was left alone")
+        return 0
     mnt, we_mounted = acquire_mount(dev)
     if not mnt:
         STATUS.finish("mount_failed", "Couldn't mount the drive")
