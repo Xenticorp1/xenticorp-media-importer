@@ -1,0 +1,12 @@
+[Unit]
+Description=Xenticorp Media Import: install updated service files
+After=local-fs.target
+# A refused install leaves the flag in place, so the path unit starts this again; the pause
+# below makes that a retry every half minute instead of a start-limit trip.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+# Refuses unless the clone is a git repo on main with no local changes. Never restarts media-import@ units.
+ExecStart=/opt/media-import/install.sh --auto
+ExecStopPost=/bin/sleep 30
