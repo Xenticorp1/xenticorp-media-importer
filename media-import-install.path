@@ -1,0 +1,11 @@
+# Xenticorp Media Import: after an update that changed an install file, the dashboard writes the
+# install-needed flag here, and this starts media-import-install.service to run install.sh --auto.
+[Unit]
+Description=Xenticorp Media Import: automatic installs after an update
+
+[Path]
+PathExists=/var/lib/media-import/install-needed
+Unit=media-import-install.service
+
+[Install]
+WantedBy=multi-user.target

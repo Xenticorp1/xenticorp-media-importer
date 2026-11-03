@@ -124,11 +124,31 @@ cd media-import
 sudo ./install.sh
 ```
 
+## Automatic installs
+
+A normal `sudo ./install.sh` also installs `media-import-install.path` and `media-import-install.service`,
+enables the path unit, and writes `/var/lib/media-import/install-armed` (the commit and time). That one
+manual run turns automatic installs on; the units live in this repo, so later updates keep them current.
+
+After an update that changed an install file (`.service`, `.path`, `.rules` or `install.sh`), the dashboard
+writes `/var/lib/media-import/install-needed`. The path unit sees it and runs `install.sh --auto` as root.
+`--auto` refuses (leaves `install-needed` in place, writes `install-failed` with the reason, exits non-zero)
+unless the clone is a git repository on branch `main` with no uncommitted changes to tracked files, and the
+media drive is mounted. A refused install is retried every 30 seconds, so fixing the cause is enough.
+Otherwise it installs as usual and reloads systemd and udev. It never stops or restarts a running
+`media-import@` service, so an import in progress is not touched. It then removes `install-needed` and
+any old `install-failed`, and writes `install-done` (time, commit, files). Running it twice is harmless.
+
+```bash
+journalctl -u media-import-install
+```
+
 ## Update
 
 ```bash
 cd /path/to/media-import && git pull
 # re-run sudo ./install.sh only if a .service, .path or .rules file changed
+# (not needed once armed, see Automatic installs)
 ```
 
 ## Status file
